@@ -1,4 +1,4 @@
-# Energy Monitor
+# Energy Monitor
 
 Makes conventional meters smart
 
