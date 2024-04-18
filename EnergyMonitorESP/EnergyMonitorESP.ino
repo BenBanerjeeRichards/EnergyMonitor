@@ -18,23 +18,39 @@ struct circular_buffer {
 
 const int SERIAL_BAUD = 9600;
 const int PIN_D1 = 5;
-const int PIN_D3 = 0;
+const int PIN_D3 = SENSOR_PIN;
 const int PIN_LED = 2;  // internal LED
-const unsigned int PULSE_INTERVAL_MS = 50;
 
-// State machine for pulsing LED
+// State for tracking pulses
+volatile unsigned long lastPulseMicros = -1;
+volatile unsigned long lastPulseDurationMicros = -1;
+// Erratic measurement tracking
+// More than 200ms at high indicates erratic measurements - e.g. sensor not attached to meter
+// If this occurs, wait for a number of normal measurements until we resume operations
+// Note that these normality measurements are discarded even if we return to OK
+const unsigned long MAX_DURATION_MICROS = 200 * 1000;
+const unsigned int RETURN_TO_NORMALITY_TRESH = 3; // Wait for this number of normal measurements until OK
+const int STATE_SENSOR_OK = 0;
+const int STATE_SENSOR_ERRATIC = 2;
+const int STATE_SENSOR_DISCONECTED = 3; 
+bool hasBeenErratic = false;                      // Have we been erratic in this sync period? Set so we can notify API
+int normalityCount = 0;                           // When in erratic mode, how many consequative OK measurements have we had
+int sensorState = STATE_SENSOR_DISCONECTED;       // Disconnected until proven otherwise
+
+// State for pulsing LED
+const unsigned int PULSE_INTERVAL_MS = 50;
 const int STATE_LED_OFF = 0;
 const int STATE_LED_ON = 1;
 int ledState = STATE_LED_OFF;
-
 unsigned long prevMillis = 0;
 unsigned long nextInterval = 1000;
+
+// State for upload syncs
 unsigned long lastUploadMs = 0;
 char uploadStr[UPLOAD_BUFFER_SIZE] = "";
 unsigned long nextUploadMs = 1000 * SYNC_PERIOD_SECONDS;
 unsigned int failureCount = 0;
 
-volatile unsigned long lastPulseMicros = -1;
 
 struct circular_buffer interval_buffer;
 
@@ -83,7 +99,18 @@ void writeStateToUploadString() {
 
     sprintf(numberStr, "%d", WiFi.RSSI());
     writeKeyValue(&writeIndex,"rssi", numberStr);
-    
+
+    const char* sensorStateStr = "ok";
+    if (sensorState == STATE_SENSOR_OK) {
+      sensorStateStr = "ok";
+    } else if (sensorState == STATE_SENSOR_DISCONECTED) {
+      sensorStateStr = "discon";
+    } else if (sensorState == STATE_SENSOR_ERRATIC || hasBeenErratic) {
+      hasBeenErratic = false; // Reset for next sync period
+      sensorStateStr = "erratic";
+    }
+
+    writeKeyValue(&writeIndex,"sensor", sensorStateStr);
     sprintf(numberStr, "%d", interval_buffer.size);
     writeKeyValue(&writeIndex,"size", numberStr);
     append(&writeIndex, "values=");
@@ -95,7 +122,7 @@ void writeStateToUploadString() {
 }
 
 
-void ICACHE_RAM_ATTR ISR_D3_high();
+void ICACHE_RAM_ATTR ISR_D3_change();
 
 void setup() {
   pinMode(PIN_D1, OUTPUT);
@@ -114,7 +141,7 @@ void setup() {
   Serial.write("Connected\n");
   digitalWrite(PIN_LED, HIGH);
 
-  attachInterrupt(digitalPinToInterrupt(PIN_D3), ISR_D3_high, RISING);
+  attachInterrupt(digitalPinToInterrupt(PIN_D3), ISR_D3_change, CHANGE);
   randomSeed(analogRead(0));
   interval_buffer = circular_init();
 }
@@ -187,14 +214,45 @@ void loop() {
 }
 
 
-void ICACHE_RAM_ATTR ISR_D3_high() {
+void ICACHE_RAM_ATTR d3Rising() {
   unsigned long now = micros();
   if (lastPulseMicros == -1) {
     // First pulse since startup
     lastPulseMicros = now;
     return;
   }
-  int duration = now - lastPulseMicros;
+  lastPulseDurationMicros = now - lastPulseMicros;
   lastPulseMicros = now;
-  interval_buffer = circular_add(interval_buffer, duration);
+}
+
+
+void ICACHE_RAM_ATTR d3Falling() {
+  // Check duration pulse was high for
+  // If too long, then mark as eratic
+  const unsigned long highDuration = micros() - lastPulseMicros;
+  if (highDuration <= MAX_DURATION_MICROS || lastPulseMicros == -1) {
+    if (sensorState == STATE_SENSOR_OK) {
+      interval_buffer = circular_add(interval_buffer, lastPulseDurationMicros);
+    } else if (sensorState == STATE_SENSOR_DISCONECTED) {
+      sensorState = STATE_SENSOR_OK;
+    } else if (sensorState = STATE_SENSOR_ERRATIC) {
+      normalityCount += 1;
+      if (normalityCount >= RETURN_TO_NORMALITY_TRESH) {
+        normalityCount = 0;
+        sensorState = STATE_SENSOR_OK;
+      }
+    }
+  } else {
+    normalityCount = 0;
+    sensorState = STATE_SENSOR_ERRATIC;
+    hasBeenErratic = true;
+  }
+}
+
+void ICACHE_RAM_ATTR ISR_D3_change() {
+  if (digitalRead(PIN_D3)) {
+    d3Rising();
+  } else {
+    d3Falling();
+  }
 }

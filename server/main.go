@@ -10,12 +10,19 @@ import (
 	"time"
 )
 
+const (
+	SensorErratic      = iota
+	SensorDisconnected = iota
+	SensorOk           = iota
+)
+
 type SyncData struct {
-	timestamp int64
-	tenantId  string
-	version   string
-	rssi      int // WiFi strength
-	intervals []int
+	timestamp   int64
+	tenantId    string
+	version     string
+	rssi        int // WiFi strength
+	intervals   []int
+	sensorState int
 }
 
 func parseSyncRequest(timestamp int64, requestStr string) (SyncData, error) {
@@ -53,10 +60,23 @@ func parseSyncRequest(timestamp int64, requestStr string) (SyncData, error) {
 		return SyncData{}, errors.New("missing version")
 	}
 
+	sensor, ok := m["sensor"]
+	if ok {
+		if sensor == "ok" {
+			syncData.sensorState = SensorOk
+		} else if sensor == "erratic" {
+			syncData.sensorState = SensorErratic
+		} else if sensor == "discon" {
+			syncData.sensorState = SensorDisconnected
+		}
+	}
+
 	intervalsStr, ok := m["values"]
 	if ok {
 		intervalsStrParts := strings.Split(intervalsStr, ",")
-		if strings.HasSuffix(intervalsStr, ",") {
+		if len(strings.TrimSpace(intervalsStr)) == 0 {
+			intervalsStrParts = []string{}
+		} else if strings.HasSuffix(intervalsStr, ",") {
 			// Should always be the case - to keep code on esp simple
 			intervalsStrParts = intervalsStrParts[:len(intervalsStrParts)-1]
 		}
