@@ -1,5 +1,6 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
+#include <WiFiManager.h>
 #include "config.h"
 
 const int CAPACITY = 100;
@@ -130,14 +131,10 @@ void setup() {
   pinMode(PIN_D3, INPUT_PULLUP);
   Serial.begin(SERIAL_BAUD);
 
-  // Connect to network to verify wifi credentials 
-  Serial.write("Connecting to network..\n");
-  WiFi.hostname("EnergyMonitor");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFiManager wifiManager;
+  wifiManager.setConfigPortalTimeout(600);
+  wifiManager.autoConnect(AP_SSID, AP_PASS);
 
-  while (WiFi.status() != WL_CONNECTED) {
-    wifiLedPattern();
-  }
   Serial.write("Connected\n");
   digitalWrite(PIN_LED, HIGH);
 
