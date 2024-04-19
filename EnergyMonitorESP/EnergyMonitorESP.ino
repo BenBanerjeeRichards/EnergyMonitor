@@ -143,14 +143,6 @@ void setup() {
   interval_buffer = circular_init();
 }
 
-void wifiLedPattern() {
-    digitalWrite(PIN_LED, LOW);
-    delay(50);
-    digitalWrite(PIN_LED, HIGH);
-    delay(100);
-}
-
-
 bool uploadSamples() {
   noInterrupts();
   unsigned int numToUpload = interval_buffer.size;
