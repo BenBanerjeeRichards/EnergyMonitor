@@ -60,6 +60,24 @@ char uploadStr[UPLOAD_BUFFER_SIZE] = "";
 unsigned long nextUploadMs = 1000 * SYNC_PERIOD_SECONDS;
 unsigned int failureCount = 0;
 
+// State for rendering to the display 
+enum class Screen { Hello, ConnectingToWifi, CurrentAndDay };
+Screen currentScreen = Screen::Hello;   // Current screen to be dislpayed
+bool lcdPendingUpdate = true;              // true when we are pending an update to lcd display
+// Actual data to be rendered to the screen. Big struct contains data for all possible screens
+// Responsibility for the rest of the code to ensure that the state exists for the currentScreen 
+struct screen_state_t {
+  // ConnectingToWifi
+  char connectingSSID[32];
+
+  // CurrentAndDay
+  int currentWatts;
+  int todayPounds;
+  int todayPence;
+};
+
+struct screen_state_t screenState;
+
 void ICACHE_RAM_ATTR ISR_D3_change();
 void ICACHE_RAM_ATTR ISR_D6_high();
 
@@ -155,12 +173,25 @@ void setup() {
   pinMode(PIN_BTN_1, INPUT);
 
   lcdCurrentUsage(320, 10, 10);
-  // lcdConnectingToWifi();
   Serial.printf("Wifi Manager\n");
   WiFiManager wifiManager;
+
+  Serial.println(wifiManager.getWiFiSSID(true));
+  wifiManager.getWiFiSSID(true).toCharArray(screenState.connectingSSID, 32);
+  if (strlen(screenState.connectingSSID) > 0) {
+    // Connecting to existing
+    currentScreen = Screen::ConnectingToWifi;
+    Serial.printf("%s\n", screenState.connectingSSID);
+    lcdPendingUpdate = true;
+    lcdRenderLoop();  // Do manually here as outside main loop
+  } else {
+    // TODO 
+  }
+
   wifiManager.setConfigPortalTimeout(600);
   wifiManager.autoConnect(AP_SSID, AP_PASS);
-
+  currentScreen = Screen::Hello;
+  lcdPendingUpdate = true;
 
   Serial.write("Connected\n");
 
@@ -200,6 +231,7 @@ bool uploadSamples() {
 }
 
 void loop() {
+  lcdRenderLoop();
   unsigned long currentMillis = millis();
   if (currentMillis - prevMillis >= nextInterval) {
     if (ledState == STATE_LED_ON) {
@@ -234,6 +266,12 @@ void loop() {
   if (btn1Pressed) {
     btn1Pressed = false;
     Serial.printf("Button 1 Pressed\n");
+
+    currentScreen = currentScreen == Screen::Hello  ? Screen::CurrentAndDay : Screen::Hello;
+    screenState.currentWatts = random(100, 10000);
+    screenState.todayPounds = 10;
+    screenState.todayPence = 23;
+    lcdPendingUpdate = true;
   }
 }
 
@@ -284,11 +322,10 @@ void ICACHE_RAM_ATTR ISR_D3_change() {
 
 void ICACHE_RAM_ATTR ISR_D6_high() {
   unsigned long now = millis();
-    // Debounce - don't register as new press
   if (now - btn1LastPressedMs > DEBOUNCE_THRESH_MS) {
-    btn1LastPressedMs = now;
     btn1Pressed = true;
   }
+  btn1LastPressedMs = now;
 }
 
 void lcdConnectingToWifi() {
@@ -333,6 +370,24 @@ void centerString(char* outputString, int width, char* stringToCenter) {
   strlcpy(outputString+leftPad, stringToCenter, width);
 }
 
+void lcdConnectingToWifi(char* ssid) {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print(" Connecting to");
+
+  clampString(ssid, 16);
+  char bottomLine[16];
+  centerString(bottomLine, 16, ssid);
+  lcd.setCursor(0,1);
+  lcd.print(bottomLine);
+}
+
+void lcdHello() {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("     Hello");
+}
+
 void lcdCurrentUsage(int watts, int todayPounds, int todayPence) {
   char wattsStr[6]; 
   char poundsStr[5]; 
@@ -357,4 +412,23 @@ void lcdCurrentUsage(int watts, int todayPounds, int todayPence) {
   strcpy(s, "abcdefghijklmnop");
   clampString(s, 16);
   lcd.print(s);
+}
+
+
+void lcdRenderLoop() {
+  if (!lcdPendingUpdate) {
+    return;
+  }
+  switch (currentScreen) {
+    case Screen::Hello:
+      lcdHello();
+      break;
+    case Screen::CurrentAndDay:
+      lcdCurrentUsage(screenState.currentWatts, 10, 20);
+      break;
+    case Screen::ConnectingToWifi:
+      lcdConnectingToWifi(screenState.connectingSSID);
+      break;
+  }
+  lcdPendingUpdate = false;
 }
