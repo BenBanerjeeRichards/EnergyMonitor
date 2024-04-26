@@ -5,20 +5,11 @@
 #include "FS.h"
 #include <LiquidCrystal_I2C.h>
 #include <Wire.h>
+#include "Circular.h"
+#include "StringUtil.h"
 
-const int CAPACITY = 100;
 const int UPLOAD_BUFFER_SIZE = 6 * CAPACITY;
 
-int mod(int a, int b) {
-    int r = a % b;
-    return r < 0 ? r + b : r;
-}
-
-struct circular_buffer {
-    volatile unsigned int buffer[CAPACITY];
-    volatile unsigned int writeIndex;
-    volatile unsigned int size;
-};
 
 const int SERIAL_BAUD = 9600;
 const int PIN_PULSE = 14;
@@ -83,30 +74,6 @@ void ICACHE_RAM_ATTR ISR_D6_high();
 
 
 struct circular_buffer interval_buffer;
-
-
-struct circular_buffer circular_init() {
-    struct circular_buffer buf;
-    buf.writeIndex = 0;
-    buf.size = 0;
-    return buf;
-}
-
-struct circular_buffer circular_add(struct circular_buffer buf, unsigned int item) {
-    buf.buffer[buf.writeIndex] = item;
-    buf.writeIndex = mod((buf.writeIndex + 1), CAPACITY);
-
-    if (buf.size < CAPACITY) {
-        buf.size++;
-    }
-    return buf;
-}
-
-
-// Get items where index 0 is latest item added to buffer and CAPACITY-1 is the last item
-unsigned int circular_get(struct circular_buffer buf, int idx) {
-    return buf.buffer[mod((buf.writeIndex - (idx + 1)),CAPACITY)];
-}
 
 
 void append(int *idx, const char* toAppend) {
@@ -336,39 +303,6 @@ void lcdConnectingToWifi() {
   lcd.print("WiFi");
 }
 
-void clampString(char* string, int max) {
-  if (strlen(string) > max) {
-    // Two dots to save on space
-    string[max-2] = '.';
-    string[max-1] = '.';
-    string[max] = '\0';
-  }
-}
-
-int intToString(char* string, int stringSize, int* stringOffset, int number, const char* fallback, int maxNumLength) {
-    int sizeNeeded = snprintf(string+*stringOffset, stringSize, "%d", number);
-    if (sizeNeeded > maxNumLength) {
-        strcpy(string+*stringOffset, fallback);
-        *stringOffset += strlen(fallback);
-        return 1;
-    } else {
-        *stringOffset += sizeNeeded;
-        return 0;
-    }
-}
-
-void centerString(char* outputString, int width, char* stringToCenter) {
-  int inputLen = strlen(stringToCenter);
-  int diff = width - inputLen;
-  if (diff < 0) {
-    return;
-  }
-  int leftPad = diff / 2;
-  for (int i = 0; i < leftPad; i++) {
-    strlcpy(outputString+i, " ", width);
-  }
-  strlcpy(outputString+leftPad, stringToCenter, width);
-}
 
 void lcdConnectingToWifi(char* ssid) {
   lcd.clear();
@@ -400,7 +334,7 @@ void lcdCurrentUsage(int watts, int todayPounds, int todayPence) {
   int position = 0;
   strlcpy(topLine+position, "Now ", 16);
   position += 4;
-  intToString(topLine, 16, &position, watts, ">999", 3);
+  intToString(topLine, 16, &position, watts, ">99999", 5);
   strlcpy(topLine+position, "W", 16);
   centerString(finalTopLine, 16, topLine);
   lcd.clear();
