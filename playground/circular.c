@@ -115,7 +115,56 @@ void write(struct circular_buffer buffer) {
 
 }
 
+void lcdCurrentUsage(int watts, int todayPounds, int todayPence) {
+  char wattsStr[6]; 
+  char poundsStr[5]; 
+  char penceStr[2];
+  int wattsSize = 0;
+  if (watts > 99999) {
+    strcpy(wattsStr, ">9999");
+    wattsSize = 6;
+  } else {
+    wattsSize = snprintf(wattsStr, 6, "%d", watts);
+  }
+
+  // poundsStr = "--";
+  // penceStr = "--";
+  char topLine[16];
+  const int leftSpaces = (16 - (3 + 1 + wattsSize + 1)) / 2; // Now(1) <space>(1) <Watts> W<2>
+  int position =0;
+
+  for (int i = 0; i < leftSpaces; i++) {
+    strlcpy(topLine+position, " ", 16);
+    position += 1;
+  }
+  strlcpy(topLine+position, "Now ", 16);
+  position += 4;
+  strlcpy(topLine+position, wattsStr, 16);
+  position += wattsSize;
+  strlcpy(topLine+position, "W", 16);
+}
+
+int intToString(const char* string, int stringSize, int* stringOffset, int number, const char* fallback, int maxNumLength) {
+    int sizeNeeded = snprintf(string+*stringOffset, stringSize, "%d", number);
+    if (sizeNeeded > maxNumLength) {
+        strcpy(string+*stringOffset, fallback);
+        *stringOffset += strlen(fallback);
+        return 1;
+    } else {
+        *stringOffset += sizeNeeded;
+        return 0;
+    }
+}
+
+
 int main(int argc, char** args) {
-    test();
+    // test();
+    lcdCurrentUsage(100230230, 20 ,10);
+
+    char test[100];
+    int offset = 0;
+    intToString(test, 100, &offset, 1000, ">999", 3);
+
+    printf("%s\n%d\n", test, offset);
     return 0;
 }

@@ -2,6 +2,9 @@
 #include <ESP8266HTTPClient.h>
 #include <WiFiManager.h>
 #include "config.h"
+#include "FS.h"
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
 
 const int CAPACITY = 100;
 const int UPLOAD_BUFFER_SIZE = 6 * CAPACITY;
@@ -18,9 +21,10 @@ struct circular_buffer {
 };
 
 const int SERIAL_BAUD = 9600;
-const int PIN_D1 = 5;
+const int PIN_PULSE = 14;
 const int PIN_D3 = SENSOR_PIN;
 const int PIN_LED = 2;  // internal LED
+const int PIN_BTN_1 = 12;
 
 // State for tracking pulses
 volatile unsigned long lastPulseMicros = -1;
@@ -29,14 +33,18 @@ volatile unsigned long lastPulseDurationMicros = -1;
 // More than 200ms at high indicates erratic measurements - e.g. sensor not attached to meter
 // If this occurs, wait for a number of normal measurements until we resume operations
 // Note that these normality measurements are discarded even if we return to OK
+enum class SensorState {Ok, Erratic, Disconnected}; 
+
 const unsigned long MAX_DURATION_MICROS = 200 * 1000;
 const unsigned int RETURN_TO_NORMALITY_TRESH = 3; // Wait for this number of normal measurements until OK
-const int STATE_SENSOR_OK = 0;
-const int STATE_SENSOR_ERRATIC = 2;
-const int STATE_SENSOR_DISCONECTED = 3; 
 bool hasBeenErratic = false;                      // Have we been erratic in this sync period? Set so we can notify API
 int normalityCount = 0;                           // When in erratic mode, how many consequative OK measurements have we had
-int sensorState = STATE_SENSOR_DISCONECTED;       // Disconnected until proven otherwise
+SensorState sensorState = SensorState::Disconnected;       // Disconnected until proven otherwise
+
+// Button debounce and state 
+volatile const int DEBOUNCE_THRESH_MS = 100;        // Any inputs in this period are ignored 
+bool btn1Pressed = false;                           // becomes true until button press event handled 
+volatile unsigned long btn1LastPressedMs = 0;       // For software debounce
 
 // State for pulsing LED
 const unsigned int PULSE_INTERVAL_MS = 50;
@@ -51,6 +59,9 @@ unsigned long lastUploadMs = 0;
 char uploadStr[UPLOAD_BUFFER_SIZE] = "";
 unsigned long nextUploadMs = 1000 * SYNC_PERIOD_SECONDS;
 unsigned int failureCount = 0;
+
+void ICACHE_RAM_ATTR ISR_D3_change();
+void ICACHE_RAM_ATTR ISR_D6_high();
 
 
 struct circular_buffer interval_buffer;
@@ -102,11 +113,11 @@ void writeStateToUploadString() {
     writeKeyValue(&writeIndex,"rssi", numberStr);
 
     const char* sensorStateStr = "ok";
-    if (sensorState == STATE_SENSOR_OK) {
+    if (sensorState == SensorState::Ok) {
       sensorStateStr = "ok";
-    } else if (sensorState == STATE_SENSOR_DISCONECTED) {
+    } else if (sensorState == SensorState::Disconnected) {
       sensorStateStr = "discon";
-    } else if (sensorState == STATE_SENSOR_ERRATIC || hasBeenErratic) {
+    } else if (sensorState == SensorState::Erratic || hasBeenErratic) {
       hasBeenErratic = false; // Reset for next sync period
       sensorStateStr = "erratic";
     }
@@ -123,22 +134,41 @@ void writeStateToUploadString() {
 }
 
 
-void ICACHE_RAM_ATTR ISR_D3_change();
+LiquidCrystal_I2C lcd(0x27,16,2); 
 
 void setup() {
-  pinMode(PIN_D1, OUTPUT);
-  pinMode(PIN_LED, OUTPUT);
-  pinMode(PIN_D3, INPUT_PULLUP);
   Serial.begin(SERIAL_BAUD);
 
+  Serial.printf("Setting up I2C display\n");
+  Wire.begin();
+  Wire.beginTransmission(0x27);
+  int error = Wire.endTransmission();
+  Serial.printf("Wire Error %d\n", error);
+  lcd.init();
+  lcd.clear();         
+  lcd.backlight(); 
+  
+
+  pinMode(PIN_PULSE, OUTPUT);
+  pinMode(PIN_LED, OUTPUT);
+  pinMode(PIN_D3, INPUT_PULLUP);
+  pinMode(PIN_BTN_1, INPUT);
+
+  lcdCurrentUsage(320, 10, 10);
+  // lcdConnectingToWifi();
+  Serial.printf("Wifi Manager\n");
   WiFiManager wifiManager;
   wifiManager.setConfigPortalTimeout(600);
   wifiManager.autoConnect(AP_SSID, AP_PASS);
 
+
   Serial.write("Connected\n");
+
   digitalWrite(PIN_LED, HIGH);
 
   attachInterrupt(digitalPinToInterrupt(PIN_D3), ISR_D3_change, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_1), ISR_D6_high, RISING);
+
   randomSeed(analogRead(0));
   interval_buffer = circular_init();
 }
@@ -174,13 +204,13 @@ void loop() {
   if (currentMillis - prevMillis >= nextInterval) {
     if (ledState == STATE_LED_ON) {
       digitalWrite(PIN_LED, LOW);
-      digitalWrite(PIN_D1, LOW);
+      digitalWrite(PIN_PULSE, LOW);
       nextInterval = random(500, 2000);
       ledState = STATE_LED_OFF;
       Serial.printf("LED off for %d\n", nextInterval + PULSE_INTERVAL_MS);
     } else if (ledState == STATE_LED_OFF) {
       digitalWrite(PIN_LED, HIGH);
-      digitalWrite(PIN_D1, HIGH);
+      digitalWrite(PIN_PULSE, HIGH);
       nextInterval = PULSE_INTERVAL_MS;
       ledState = STATE_LED_ON;
     }
@@ -200,6 +230,11 @@ void loop() {
       nextUploadMs = millis() + (backoffCount * 500);
     }
   }
+
+  if (btn1Pressed) {
+    btn1Pressed = false;
+    Serial.printf("Button 1 Pressed\n");
+  }
 }
 
 
@@ -213,27 +248,27 @@ void ICACHE_RAM_ATTR d3Rising() {
   lastPulseDurationMicros = now - lastPulseMicros;
   lastPulseMicros = now;
 }
-
+ 
 
 void ICACHE_RAM_ATTR d3Falling() {
   // Check duration pulse was high for
   // If too long, then mark as eratic
   const unsigned long highDuration = micros() - lastPulseMicros;
   if (highDuration <= MAX_DURATION_MICROS || lastPulseMicros == -1) {
-    if (sensorState == STATE_SENSOR_OK) {
+    if (sensorState == SensorState::Ok) {
       interval_buffer = circular_add(interval_buffer, lastPulseDurationMicros);
-    } else if (sensorState == STATE_SENSOR_DISCONECTED) {
-      sensorState = STATE_SENSOR_OK;
-    } else if (sensorState = STATE_SENSOR_ERRATIC) {
+    } else if (sensorState == SensorState::Disconnected) {
+      sensorState = SensorState::Ok;
+    } else if (sensorState == SensorState::Erratic) {
       normalityCount += 1;
       if (normalityCount >= RETURN_TO_NORMALITY_TRESH) {
         normalityCount = 0;
-        sensorState = STATE_SENSOR_OK;
+        sensorState = SensorState::Ok;
       }
     }
   } else {
     normalityCount = 0;
-    sensorState = STATE_SENSOR_ERRATIC;
+    sensorState = SensorState::Ok;
     hasBeenErratic = true;
   }
 }
@@ -244,4 +279,82 @@ void ICACHE_RAM_ATTR ISR_D3_change() {
   } else {
     d3Falling();
   }
+}
+
+
+void ICACHE_RAM_ATTR ISR_D6_high() {
+  unsigned long now = millis();
+    // Debounce - don't register as new press
+  if (now - btn1LastPressedMs > DEBOUNCE_THRESH_MS) {
+    btn1LastPressedMs = now;
+    btn1Pressed = true;
+  }
+}
+
+void lcdConnectingToWifi() {
+  lcd.clear();
+  lcd.setCursor(1,0);   
+  lcd.print("Connecting to");
+  lcd.setCursor(6,1);   
+  lcd.print("WiFi");
+}
+
+void clampString(char* string, int max) {
+  if (strlen(string) > max) {
+    // Two dots to save on space
+    string[max-2] = '.';
+    string[max-1] = '.';
+    string[max] = '\0';
+  }
+}
+
+int intToString(char* string, int stringSize, int* stringOffset, int number, const char* fallback, int maxNumLength) {
+    int sizeNeeded = snprintf(string+*stringOffset, stringSize, "%d", number);
+    if (sizeNeeded > maxNumLength) {
+        strcpy(string+*stringOffset, fallback);
+        *stringOffset += strlen(fallback);
+        return 1;
+    } else {
+        *stringOffset += sizeNeeded;
+        return 0;
+    }
+}
+
+void centerString(char* outputString, int width, char* stringToCenter) {
+  int inputLen = strlen(stringToCenter);
+  int diff = width - inputLen;
+  if (diff < 0) {
+    return;
+  }
+  int leftPad = diff / 2;
+  for (int i = 0; i < leftPad; i++) {
+    strlcpy(outputString+i, " ", width);
+  }
+  strlcpy(outputString+leftPad, stringToCenter, width);
+}
+
+void lcdCurrentUsage(int watts, int todayPounds, int todayPence) {
+  char wattsStr[6]; 
+  char poundsStr[5]; 
+  char penceStr[2];
+
+  // poundsStr = "--";
+  // penceStr = "--";
+  char topLine[16];
+  char finalTopLine[16];
+  int position = 0;
+  strlcpy(topLine+position, "Now ", 16);
+  position += 4;
+  intToString(topLine, 16, &position, watts, ">999", 3);
+  strlcpy(topLine+position, "W", 16);
+  centerString(finalTopLine, 16, topLine);
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print(finalTopLine);
+
+  lcd.setCursor(0, 1);
+  char s[20];
+  strcpy(s, "abcdefghijklmnop");
+  clampString(s, 16);
+  lcd.print(s);
 }
