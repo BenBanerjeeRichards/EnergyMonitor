@@ -88,6 +88,10 @@ struct screen_state_t {
   int monthPence;
 
 };
+// Backlight - turn off when inactive
+const unsigned int BACKLIGHT_TIMEOUT_MS = 30 * 1000;
+bool backlightIsOn = false;
+unsigned int turnBacklightOffAt;
 
 byte poundLcdChar[8] = {
 		0b01111,
@@ -160,6 +164,16 @@ void ICACHE_RAM_ATTR ISR_D6_high();
 struct circular_buffer interval_buffer;
 WifiStrength getWiFiStrength();
 
+LiquidCrystal_I2C lcd(0x27,16,2); 
+
+void turnOnBacklight() {
+  if (!backlightIsOn) {
+    lcd.backlight();
+    backlightIsOn = true;
+  }
+  turnBacklightOffAt = millis() + BACKLIGHT_TIMEOUT_MS;
+}
+
 void append(int *idx, const char* toAppend) {
     strlcpy(uploadStr+*idx, toAppend, UPLOAD_BUFFER_SIZE);
     *idx += strlen(toAppend);
@@ -203,7 +217,6 @@ void writeStateToUploadString() {
 }
 
 
-LiquidCrystal_I2C lcd(0x27,16,2); 
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
@@ -215,7 +228,7 @@ void setup() {
   Serial.printf("Wire Error %d\n", error);
   lcd.init();
   lcd.clear();         
-  lcd.backlight(); 
+  lcd.backlight(); // Keep on for setup
   lcd.createChar(LCD_CUSTOM_POUND, poundLcdChar);
   lcd.createChar(LCD_CUSTOM_WIFI_VERY_STRONG, wifiStrenghVeryGoodChar);
   lcd.createChar(LCD_CUSTOM_WIFI_GOOD, wifiStrenghGoodChar);
@@ -256,6 +269,7 @@ void setup() {
 
   randomSeed(analogRead(0));
   interval_buffer = circular_init();
+  turnOnBacklight();  // Now setup complete, set backlight on timer
 }
 
 bool uploadSamples() {
@@ -322,19 +336,23 @@ void loop() {
     Serial.printf("Button 1 Pressed\n");
     screenState.buttonCount++;
     lcdPendingUpdate = true;
-    if (currentScreen == Screen::Hello) {
-      currentScreen = Screen::CurrentAndDay;
-    } else if (currentScreen == Screen::CurrentAndDay) {
-      currentScreen = Screen::CurrentAndMonth;
-    } else if (currentScreen == Screen::CurrentAndMonth) {
-      currentScreen = Screen::Hello;
+    // Only move screen if backlgiht is on - o/w first press should only turn backlight on
+    if (backlightIsOn) {
+      if (currentScreen == Screen::Hello) {
+        currentScreen = Screen::CurrentAndDay;
+      } else if (currentScreen == Screen::CurrentAndDay) {
+        currentScreen = Screen::CurrentAndMonth;
+      } else if (currentScreen == Screen::CurrentAndMonth) {
+        currentScreen = Screen::Hello;
+      }
+      screenState.currentWatts = random(100, 10000);
+      screenState.todayPounds = random(0, 300);
+      screenState.todayPence = random(0, 99);
+      screenState.monthPounds = random(400, 1000);
+      screenState.monthPence = random(0, 20);
+      lcdPendingUpdate = true;
     }
-    screenState.currentWatts = random(100, 10000);
-    screenState.todayPounds = random(0, 300);
-    screenState.todayPence = random(0, 99);
-    screenState.monthPounds = random(400, 1000);
-    screenState.monthPence = random(0, 20);
-    lcdPendingUpdate = true;
+    turnOnBacklight();
   }
 
   if (millis() >= nextCheckWifiStatusAt) {
@@ -345,6 +363,11 @@ void loop() {
       lcdPendingUpdate = true;
     }
     nextCheckWifiStatusAt = millis() + WIFI_STATUS_UPDATE_PERIOD_MS;
+  }
+
+  if (backlightIsOn && millis() > turnBacklightOffAt) {
+    backlightIsOn = false;
+    lcd.noBacklight();
   }
 }
 
