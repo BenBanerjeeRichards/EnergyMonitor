@@ -52,20 +52,45 @@ unsigned long nextUploadMs = 1000 * SYNC_PERIOD_SECONDS;
 unsigned int failureCount = 0;
 
 // State for rendering to the display 
-enum class Screen { Hello, ConnectingToWifi, CurrentAndDay };
+enum class Screen { 
+  Hello, 
+  ConnectingToWifi,   // Connecting to a specific (already saved) AP
+  CurrentAndDay,      // Show current usage in W and the total used this day 
+  CurrentAndMonth     // Same as above, but show the billing period (month)
+};
+
 Screen currentScreen = Screen::Hello;   // Current screen to be dislpayed
 bool lcdPendingUpdate = true;              // true when we are pending an update to lcd display
 // Actual data to be rendered to the screen. Big struct contains data for all possible screens
 // Responsibility for the rest of the code to ensure that the state exists for the currentScreen 
 struct screen_state_t {
   // ConnectingToWifi
-  char connectingSSID[32];
+  char connectingSSID[33];
 
   // CurrentAndDay
   int currentWatts;
   int todayPounds;
   int todayPence;
+
+  // Month
+  int monthPounds;
+  int monthPence;
+
 };
+
+byte poundLcdChar[8] = {
+		0b01111,
+	0b01000,
+	0b01000,
+	0b11110,
+	0b01000,
+	0b01000,
+	0b11111,
+	0b00000
+};
+
+const int LCD_CUSTOM_POUND = 0;
+
 
 struct screen_state_t screenState;
 
@@ -132,6 +157,7 @@ void setup() {
   lcd.init();
   lcd.clear();         
   lcd.backlight(); 
+  lcd.createChar(LCD_CUSTOM_POUND, poundLcdChar);
   
 
   pinMode(PIN_PULSE, OUTPUT);
@@ -139,7 +165,6 @@ void setup() {
   pinMode(PIN_D3, INPUT_PULLUP);
   pinMode(PIN_BTN_1, INPUT);
 
-  lcdCurrentUsage(320, 10, 10);
   Serial.printf("Wifi Manager\n");
   WiFiManager wifiManager;
 
@@ -234,10 +259,18 @@ void loop() {
     btn1Pressed = false;
     Serial.printf("Button 1 Pressed\n");
 
-    currentScreen = currentScreen == Screen::Hello  ? Screen::CurrentAndDay : Screen::Hello;
+    if (currentScreen == Screen::Hello) {
+      currentScreen = Screen::CurrentAndDay;
+    } else if (currentScreen == Screen::CurrentAndDay) {
+      currentScreen = Screen::CurrentAndMonth;
+    } else if (currentScreen == Screen::CurrentAndMonth) {
+      currentScreen = Screen::Hello;
+    }
     screenState.currentWatts = random(100, 10000);
-    screenState.todayPounds = 10;
-    screenState.todayPence = 23;
+    screenState.todayPounds = random(0, 300);
+    screenState.todayPence = random(0, 99);
+    screenState.monthPounds = random(400, 1000);
+    screenState.monthPence = random(0, 20);
     lcdPendingUpdate = true;
   }
 }
@@ -310,7 +343,7 @@ void lcdConnectingToWifi(char* ssid) {
   lcd.print(" Connecting to");
 
   clampString(ssid, 16);
-  char bottomLine[16];
+  char bottomLine[17];
   centerString(bottomLine, 16, ssid);
   lcd.setCursor(0,1);
   lcd.print(bottomLine);
@@ -322,15 +355,9 @@ void lcdHello() {
   lcd.print("     Hello");
 }
 
-void lcdCurrentUsage(int watts, int todayPounds, int todayPence) {
-  char wattsStr[6]; 
-  char poundsStr[5]; 
-  char penceStr[2];
-
-  // poundsStr = "--";
-  // penceStr = "--";
-  char topLine[16];
-  char finalTopLine[16];
+void lcdCurrentUsage(const char* periodString, int watts, int todayPounds, int todayPence) {
+  char topLine[17];
+  char finalTopLine[17];
   int position = 0;
   strlcpy(topLine+position, "Now ", 16);
   position += 4;
@@ -341,11 +368,35 @@ void lcdCurrentUsage(int watts, int todayPounds, int todayPence) {
   lcd.setCursor(0,0);
   lcd.print(finalTopLine);
 
-  lcd.setCursor(0, 1);
-  char s[20];
-  strcpy(s, "abcdefghijklmnop");
-  clampString(s, 16);
-  lcd.print(s);
+  char bottomLine[17];
+  char finalBottomLine[17];
+  strcpy(bottomLine, periodString);
+  position = strlen(periodString);
+  strcpy(bottomLine+position, " \243");
+  position += 2;
+  intToString(bottomLine, 16, &position, todayPounds, "---", 4);
+  const char* sepStr = todayPence < 10 ? ".0" : ".";
+  strcpy(bottomLine+position, sepStr);
+  position += strlen(sepStr);
+  intToString(bottomLine, 16, &position, todayPence, "--", 2);
+  centerString(finalBottomLine, 16, bottomLine);
+  Serial.printf("%s|%s\n", bottomLine, finalBottomLine);
+  lcdWriteWithSpecials(finalBottomLine, 0, 1);
+}
+
+void lcdWriteWithSpecials(char* string, int startCol, int row) {
+  char tmp[2];
+  for (int col = startCol; col < strlen(string)+startCol; col++) {
+    lcd.setCursor(col, row);
+    if (string[col] == '\243') {
+      lcd.write(LCD_CUSTOM_POUND);
+    } else {
+      strncpy(tmp, string+col, 1);
+      tmp[1] = '\0';
+      lcd.print(tmp);
+    }
+  }
+
 }
 
 
@@ -358,8 +409,12 @@ void lcdRenderLoop() {
       lcdHello();
       break;
     case Screen::CurrentAndDay:
-      lcdCurrentUsage(screenState.currentWatts, 10, 20);
+      lcdCurrentUsage("Day", screenState.currentWatts, screenState.todayPounds, screenState.todayPence);
       break;
+    case Screen::CurrentAndMonth:
+      lcdCurrentUsage("Month", screenState.currentWatts, screenState.monthPounds, screenState.monthPence);
+      break;
+
     case Screen::ConnectingToWifi:
       lcdConnectingToWifi(screenState.connectingSSID);
       break;
