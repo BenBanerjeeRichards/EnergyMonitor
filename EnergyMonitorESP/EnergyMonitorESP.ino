@@ -33,7 +33,7 @@ int normalityCount = 0;                           // When in erratic mode, how m
 SensorState sensorState = SensorState::Disconnected;       // Disconnected until proven otherwise
 
 // Button debounce and state 
-volatile const int DEBOUNCE_THRESH_MS = 100;        // Any inputs in this period are ignored 
+const int DEBOUNCE_THRESH_MS = 150;        // Any inputs in this period are ignored 
 bool btn1Pressed = false;                           // becomes true until button press event handled 
 volatile unsigned long btn1LastPressedMs = 0;       // For software debounce
 
@@ -51,9 +51,18 @@ char uploadStr[UPLOAD_BUFFER_SIZE] = "";
 unsigned long nextUploadMs = 1000 * SYNC_PERIOD_SECONDS;
 unsigned int failureCount = 0;
 
+// Update wifi stength info 
+const unsigned int WIFI_STATUS_UPDATE_PERIOD_MS = 5000;
+unsigned long nextCheckWifiStatusAt = 0;
+
+enum class WifiStrength {
+  VeryGood, Good, Ok, Poor, Disconnected
+};
+
 // State for rendering to the display 
 enum class Screen { 
   Hello, 
+  ConnectToAp,        // Instruct user to connect to the AP for setup
   ConnectingToWifi,   // Connecting to a specific (already saved) AP
   CurrentAndDay,      // Show current usage in W and the total used this day 
   CurrentAndMonth     // Same as above, but show the billing period (month)
@@ -64,6 +73,7 @@ bool lcdPendingUpdate = true;              // true when we are pending an update
 // Actual data to be rendered to the screen. Big struct contains data for all possible screens
 // Responsibility for the rest of the code to ensure that the state exists for the currentScreen 
 struct screen_state_t {
+  int buttonCount;  // debug
   // ConnectingToWifi
   char connectingSSID[33];
 
@@ -71,6 +81,7 @@ struct screen_state_t {
   int currentWatts;
   int todayPounds;
   int todayPence;
+  WifiStrength wifiStrength;
 
   // Month
   int monthPounds;
@@ -89,7 +100,55 @@ byte poundLcdChar[8] = {
 	0b00000
 };
 
+byte wifiStrenghVeryGoodChar[8] {
+	0b00000,
+	0b00000,
+	0b00001,
+	0b00011,
+	0b00111,
+	0b01111,
+	0b11111,
+	0b00000
+};
+
+byte wifiStrenghGoodChar[8] = {
+	0b00000,
+	0b00000,
+	0b00000,
+	0b00010,
+	0b00110,
+	0b01110,
+	0b11110,
+	0b00000
+};
+
+byte wifiStrenghOkChar[8] = {
+	0b00000,
+	0b00000,
+	0b00000,
+	0b00000,
+	0b00100,
+	0b01100,
+	0b11100,
+	0b00000
+};
+
+byte wifiStrenghPoorChar[8] = {
+	0b00000,
+	0b00000,
+	0b00000,
+	0b00000,
+	0b00000,
+	0b01000,
+	0b11000,
+	0b00000
+};
+
 const int LCD_CUSTOM_POUND = 0;
+const int LCD_CUSTOM_WIFI_VERY_STRONG = 1;
+const int LCD_CUSTOM_WIFI_GOOD = 2;
+const int LCD_CUSTOM_WIFI_OK = 3;
+const int LCD_CUSTOM_WIFI_POOR = 4;
 
 
 struct screen_state_t screenState;
@@ -99,7 +158,7 @@ void ICACHE_RAM_ATTR ISR_D6_high();
 
 
 struct circular_buffer interval_buffer;
-
+WifiStrength getWiFiStrength();
 
 void append(int *idx, const char* toAppend) {
     strlcpy(uploadStr+*idx, toAppend, UPLOAD_BUFFER_SIZE);
@@ -158,12 +217,15 @@ void setup() {
   lcd.clear();         
   lcd.backlight(); 
   lcd.createChar(LCD_CUSTOM_POUND, poundLcdChar);
-  
+  lcd.createChar(LCD_CUSTOM_WIFI_VERY_STRONG, wifiStrenghVeryGoodChar);
+  lcd.createChar(LCD_CUSTOM_WIFI_GOOD, wifiStrenghGoodChar);
+  lcd.createChar(LCD_CUSTOM_WIFI_OK, wifiStrenghOkChar);
+  lcd.createChar(LCD_CUSTOM_WIFI_POOR, wifiStrenghPoorChar);
 
   pinMode(PIN_PULSE, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_D3, INPUT_PULLUP);
-  pinMode(PIN_BTN_1, INPUT);
+  pinMode(PIN_BTN_1, INPUT_PULLUP);
 
   Serial.printf("Wifi Manager\n");
   WiFiManager wifiManager;
@@ -190,7 +252,7 @@ void setup() {
   digitalWrite(PIN_LED, HIGH);
 
   attachInterrupt(digitalPinToInterrupt(PIN_D3), ISR_D3_change, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(PIN_BTN_1), ISR_D6_high, RISING);
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_1), ISR_D6_high, FALLING);
 
   randomSeed(analogRead(0));
   interval_buffer = circular_init();
@@ -258,7 +320,8 @@ void loop() {
   if (btn1Pressed) {
     btn1Pressed = false;
     Serial.printf("Button 1 Pressed\n");
-
+    screenState.buttonCount++;
+    lcdPendingUpdate = true;
     if (currentScreen == Screen::Hello) {
       currentScreen = Screen::CurrentAndDay;
     } else if (currentScreen == Screen::CurrentAndDay) {
@@ -273,8 +336,31 @@ void loop() {
     screenState.monthPence = random(0, 20);
     lcdPendingUpdate = true;
   }
+
+  if (millis() >= nextCheckWifiStatusAt) {
+    const WifiStrength newStrength = getWiFiStrength();
+    // Check if difference to prevent unneeded lcd updates
+    if (newStrength != screenState.wifiStrength) {
+      screenState.wifiStrength = newStrength;
+      lcdPendingUpdate = true;
+    }
+    nextCheckWifiStatusAt = millis() + WIFI_STATUS_UPDATE_PERIOD_MS;
+  }
 }
 
+
+WifiStrength getWiFiStrength() {
+  int rssi = WiFi.RSSI();
+  if (rssi >= -70) {
+    return WifiStrength::VeryGood;
+  } else if (rssi >= -80 && rssi <= -71) {
+    return WifiStrength::Good;
+  } else if (rssi >= -90 && rssi <= -81) {
+    return WifiStrength::Ok;
+  } else {
+    return WifiStrength::Poor;
+  }
+}
 
 void ICACHE_RAM_ATTR d3Rising() {
   unsigned long now = micros();
@@ -324,8 +410,8 @@ void ICACHE_RAM_ATTR ISR_D6_high() {
   unsigned long now = millis();
   if (now - btn1LastPressedMs > DEBOUNCE_THRESH_MS) {
     btn1Pressed = true;
+    btn1LastPressedMs = now;  // Time debounce from trigger
   }
-  btn1LastPressedMs = now;
 }
 
 void lcdConnectingToWifi() {
@@ -353,19 +439,40 @@ void lcdHello() {
   lcd.clear();
   lcd.setCursor(0,0);
   lcd.print("     Hello");
+
+  lcd.setCursor(0, 1);
+  char bottom[16];
+  int x =0 ;
+  intToString(bottom, 16, &x, screenState.buttonCount, "--", 10);
+  lcd.print(bottom);
 }
 
-void lcdCurrentUsage(const char* periodString, int watts, int todayPounds, int todayPence) {
-  char topLine[17];
+int specialCharForWifiStrength(WifiStrength strength) {
+  if (strength == WifiStrength::VeryGood) {
+    return LCD_CUSTOM_WIFI_VERY_STRONG;
+  } else if (strength == WifiStrength::Good) {
+    return LCD_CUSTOM_WIFI_GOOD;
+  } else if (strength == WifiStrength::Ok) {
+    return LCD_CUSTOM_WIFI_OK;
+  } else if (strength == WifiStrength::Poor) {
+    return LCD_CUSTOM_WIFI_POOR;
+  }\
+  // TODO disconnected
+  return 1;
+}
+
+void lcdCurrentUsage(WifiStrength strength, const char* periodString, int watts, int todayPounds, int todayPence) {
+  char topLine[16];
   char finalTopLine[17];
   int position = 0;
-  strlcpy(topLine+position, "Now ", 16);
+  strlcpy(topLine+position, "Now ", 15);
   position += 4;
-  intToString(topLine, 16, &position, watts, ">99999", 5);
-  strlcpy(topLine+position, "W", 16);
-  centerString(finalTopLine, 16, topLine);
+  intToString(topLine, 15, &position, watts, ">99999", 5);
+  strlcpy(topLine+position, "W", 15);
+  centerString(finalTopLine, 15, topLine);
   lcd.clear();
   lcd.setCursor(0,0);
+  lcd.write(specialCharForWifiStrength(strength));
   lcd.print(finalTopLine);
 
   char bottomLine[17];
@@ -382,6 +489,20 @@ void lcdCurrentUsage(const char* periodString, int watts, int todayPounds, int t
   centerString(finalBottomLine, 16, bottomLine);
   Serial.printf("%s|%s\n", bottomLine, finalBottomLine);
   lcdWriteWithSpecials(finalBottomLine, 0, 1);
+}
+
+void lcdConnectToAP() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connect to WiFi");
+  lcd.setCursor(0, 1);
+
+  char bottomLine[17];
+  char finalBottomLine[17];
+  strncpy(bottomLine, AP_SSID, 16);
+  centerString(finalBottomLine, 16, bottomLine);
+  lcd.setCursor(0, 1);
+  lcd.print(finalBottomLine);
 }
 
 void lcdWriteWithSpecials(char* string, int startCol, int row) {
@@ -409,15 +530,18 @@ void lcdRenderLoop() {
       lcdHello();
       break;
     case Screen::CurrentAndDay:
-      lcdCurrentUsage("Day", screenState.currentWatts, screenState.todayPounds, screenState.todayPence);
+      lcdCurrentUsage(screenState.wifiStrength, "Day", screenState.currentWatts, screenState.todayPounds, screenState.todayPence);
       break;
     case Screen::CurrentAndMonth:
-      lcdCurrentUsage("Month", screenState.currentWatts, screenState.monthPounds, screenState.monthPence);
+      lcdCurrentUsage(screenState.wifiStrength, "Month", screenState.currentWatts, screenState.monthPounds, screenState.monthPence);
       break;
-
     case Screen::ConnectingToWifi:
       lcdConnectingToWifi(screenState.connectingSSID);
       break;
+    case Screen::ConnectToAp:
+      lcdConnectToAP();
+      break;
+
   }
   lcdPendingUpdate = false;
 }
