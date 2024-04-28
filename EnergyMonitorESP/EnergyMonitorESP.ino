@@ -209,7 +209,7 @@ void ICACHE_RAM_ATTR ISR_D6_high();
 struct circular_buffer interval_buffer;
 WifiStrength getWiFiStrength();
 
-LiquidCrystal_I2C lcd(0x27,16,2); 
+LiquidCrystal_I2C lcd(LCD_ADDR, 16,2); 
 
 void turnOnBacklight() {
   if (!backlightIsOn) {
@@ -265,12 +265,13 @@ void writeStateToUploadString() {
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
-
-  Serial.printf("Setting up I2C display\n");
   Wire.begin();
-  Wire.beginTransmission(0x27);
+  Serial.println("Starting setup");
+  Wire.beginTransmission(LCD_ADDR);
   int error = Wire.endTransmission();
-  Serial.printf("Wire Error %d\n", error);
+  if (error) {
+    Serial.printf(" Failed to find LCD at I2C address %d - error code: %d\n", LCD_ADDR, err);
+  }
   lcd.init();
   lcd.clear();         
   lcd.backlight(); // Keep on for setup
@@ -285,10 +286,7 @@ void setup() {
   pinMode(PIN_D3, INPUT_PULLUP);
   pinMode(PIN_BTN_1, INPUT_PULLUP);
 
-  Serial.printf("Wifi Manager\n");
   WiFiManager wifiManager;
-
-  Serial.println(wifiManager.getWiFiSSID(true));
   wifiManager.getWiFiSSID(true).toCharArray(screenState.connectingSSID, 32);
   if (strlen(screenState.connectingSSID) > 0) {
     // Connecting to existing
@@ -305,8 +303,6 @@ void setup() {
   currentScreen = Screen::Hello;
   lcdPendingUpdate = true;
 
-  Serial.write("Connected\n");
-
   digitalWrite(PIN_LED, HIGH);
 
   attachInterrupt(digitalPinToInterrupt(PIN_D3), ISR_D3_change, CHANGE);
@@ -315,6 +311,7 @@ void setup() {
   randomSeed(analogRead(0));
   interval_buffer = circular_init();
   turnOnBacklight();  // Now setup complete, set backlight on timer
+  Serial.println("Setpu completed");
 }
 
 bool uploadSamples() {
@@ -401,6 +398,7 @@ void loop() {
   }
 
   if (millis() >= nextCheckWifiStatusAt) {
+    // Update Wifi signal strength that is shown on LCD
     const WifiStrength newStrength = getWiFiStrength();
     // Check if difference to prevent unneeded lcd updates
     if (newStrength != screenState.wifiStrength) {

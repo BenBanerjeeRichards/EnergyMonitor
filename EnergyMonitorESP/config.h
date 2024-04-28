@@ -8,3 +8,4 @@
 #define SENSOR_PIN 0
 #define AP_SSID "EnergyMonitor"
 #define AP_PASS "energymonitor"
+#define LCD_ADDR 0x27
