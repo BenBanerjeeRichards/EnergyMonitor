@@ -59,13 +59,18 @@ enum class WifiStrength {
   VeryGood, Good, Ok, Poor, Disconnected
 };
 
+enum class Error {
+  ErraticSensor 
+};
+
 // State for rendering to the display 
 enum class Screen { 
   Hello, 
   ConnectToAp,        // Instruct user to connect to the AP for setup
   ConnectingToWifi,   // Connecting to a specific (already saved) AP
   CurrentAndDay,      // Show current usage in W and the total used this day 
-  CurrentAndMonth     // Same as above, but show the billing period (month)
+  CurrentAndMonth,    // Same as above, but show the billing period (month)
+  Error               // Display an error code 
 };
 
 Screen currentScreen = Screen::Hello;   // Current screen to be dislpayed
@@ -86,12 +91,53 @@ struct screen_state_t {
   // Month
   int monthPounds;
   int monthPence;
-
+  
+  // Error
+  Error error;
 };
+
 // Backlight - turn off when inactive
 const unsigned int BACKLIGHT_TIMEOUT_MS = 30 * 1000;
 bool backlightIsOn = false;
 unsigned int turnBacklightOffAt;
+
+struct screen_state_t screenState;
+
+
+// Always 3 digits (EXY)
+const char* errorCode(Error error) {
+  if (error == Error::ErraticSensor) {
+    return "E21";
+  }
+  return "E??";
+}
+
+// Always less than 16 chars
+const char* errorMessage(Error error) {
+  if (error == Error::ErraticSensor) {
+    return "Erratic Sensor";
+  }
+  return "Unknown";
+}
+
+Error error;
+boolean activeError = false;
+Screen screenRestoreToAfterError;
+
+void setError(Error error) {
+  error = error;
+  screenRestoreToAfterError = currentScreen;
+  screenState.error = error;
+  currentScreen = Screen::Error;
+  activeError = false;
+  lcdPendingUpdate = true;
+}
+
+void clearError() {
+  activeError = false;
+  currentScreen = screenRestoreToAfterError;
+  lcdPendingUpdate = true;
+}
 
 byte poundLcdChar[8] = {
 		0b01111,
@@ -155,7 +201,6 @@ const int LCD_CUSTOM_WIFI_OK = 3;
 const int LCD_CUSTOM_WIFI_POOR = 4;
 
 
-struct screen_state_t screenState;
 
 void ICACHE_RAM_ATTR ISR_D3_change();
 void ICACHE_RAM_ATTR ISR_D6_high();
@@ -479,7 +524,7 @@ int specialCharForWifiStrength(WifiStrength strength) {
     return LCD_CUSTOM_WIFI_OK;
   } else if (strength == WifiStrength::Poor) {
     return LCD_CUSTOM_WIFI_POOR;
-  }\
+  }
   // TODO disconnected
   return 1;
 }
@@ -528,6 +573,19 @@ void lcdConnectToAP() {
   lcd.print(finalBottomLine);
 }
 
+void lcdError(Error error) {
+  char topLine[17];
+  strcpy(topLine, "ERROR           ");
+  strncpy(topLine+13, errorCode(error), 3);
+  char bottomLine[17];
+  strncpy(bottomLine, errorMessage(error), 16);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(topLine);
+  lcd.setCursor(0, 1);
+  lcd.print(bottomLine);
+}
+
 void lcdWriteWithSpecials(char* string, int startCol, int row) {
   char tmp[2];
   for (int col = startCol; col < strlen(string)+startCol; col++) {
@@ -540,7 +598,6 @@ void lcdWriteWithSpecials(char* string, int startCol, int row) {
       lcd.print(tmp);
     }
   }
-
 }
 
 
@@ -563,6 +620,9 @@ void lcdRenderLoop() {
       break;
     case Screen::ConnectToAp:
       lcdConnectToAP();
+      break;
+    case Screen::Error:
+      lcdError(screenState.error);
       break;
 
   }
