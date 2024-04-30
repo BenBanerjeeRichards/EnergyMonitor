@@ -9,3 +9,4 @@
 #define AP_SSID "EnergyMonitor"
 #define AP_PASS "energymonitor"
 #define LCD_ADDR 0x27
+#define IMPL_PER_KWH 800

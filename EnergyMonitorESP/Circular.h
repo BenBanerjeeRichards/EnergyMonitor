@@ -15,4 +15,6 @@ struct circular_buffer circular_add(struct circular_buffer buf, unsigned int ite
 
 unsigned int circular_get(struct circular_buffer buf, int idx);
 
+int mod(int a, int b);
+
 #endif 

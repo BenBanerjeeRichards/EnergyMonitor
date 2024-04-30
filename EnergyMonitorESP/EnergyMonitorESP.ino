@@ -8,7 +8,7 @@
 #include "Circular.h"
 #include "StringUtil.h"
 
-const int UPLOAD_BUFFER_SIZE = 6 * CAPACITY;
+const int UPLOAD_BUFFER_SIZE = 14 * CAPACITY;
 
 
 const int SERIAL_BAUD = 9600;
@@ -60,7 +60,8 @@ enum class WifiStrength {
 };
 
 enum class Error {
-  ErraticSensor 
+  ErraticSensor,
+  UploadMem,
 };
 
 // State for rendering to the display 
@@ -106,6 +107,9 @@ struct screen_state_t screenState;
 
 // Always 3 digits (EXY)
 const char* errorCode(Error error) {
+  if (error == Error::UploadMem) {
+    return "E11";
+  }
   if (error == Error::ErraticSensor) {
     return "E21";
   }
@@ -116,6 +120,9 @@ const char* errorCode(Error error) {
 const char* errorMessage(Error error) {
   if (error == Error::ErraticSensor) {
     return "Erratic Sensor";
+  }
+  if (error == Error::UploadMem) {
+    return "Upload memory";
   }
   return "Unknown";
 }
@@ -207,6 +214,9 @@ void ICACHE_RAM_ATTR ISR_D6_high();
 
 
 struct circular_buffer interval_buffer;
+unsigned long lastDurationUs = 0;
+bool currentUpdated = false;
+
 WifiStrength getWiFiStrength();
 
 LiquidCrystal_I2C lcd(LCD_ADDR, 16,2); 
@@ -258,9 +268,18 @@ void writeStateToUploadString() {
         sprintf(numberStr, "%d", circular_get(interval_buffer, i));
         append(&writeIndex, numberStr);
         append(&writeIndex, ",");
+
+        if (writeIndex > UPLOAD_BUFFER_SIZE - 20) {
+          // If we run out of memory in upload string, then show error and clear buffer 
+          currentScreen = Screen::Error;
+          screenState.error = Error::UploadMem;
+          lcdPendingUpdate = true;
+          uploadStr[0] = '\0';
+          interval_buffer.size = 0;
+          return;
+        }
     }
 }
-
 
 
 void setup() {
@@ -270,7 +289,7 @@ void setup() {
   Wire.beginTransmission(LCD_ADDR);
   int error = Wire.endTransmission();
   if (error) {
-    Serial.printf(" Failed to find LCD at I2C address %d - error code: %d\n", LCD_ADDR, err);
+    Serial.printf(" Failed to find LCD at I2C address %d - error code: %d\n", LCD_ADDR, error);
   }
   lcd.init();
   lcd.clear();         
@@ -340,14 +359,23 @@ bool uploadSamples() {
   return success;
 }
 
+int calculateCurrentPowerWatts(int periodMs) {
+  if (periodMs == 0) {
+    return 0;
+  }
+  double periodSeconds = (double)periodMs / 1000.0;
+  return 1000 * (3600 / periodSeconds) / IMPL_PER_KWH;
+}
+
 void loop() {
   lcdRenderLoop();
   unsigned long currentMillis = millis();
-  if (currentMillis - prevMillis >= nextInterval) {
+  unsigned long diff = currentMillis - prevMillis;
+  if (diff >= nextInterval) {
     if (ledState == STATE_LED_ON) {
       digitalWrite(PIN_LED, LOW);
       digitalWrite(PIN_PULSE, LOW);
-      nextInterval = random(500, 2000);
+      nextInterval = random(500, 3000);
       ledState = STATE_LED_OFF;
       Serial.printf("LED off for %d\n", nextInterval + PULSE_INTERVAL_MS);
     } else if (ledState == STATE_LED_OFF) {
@@ -360,7 +388,8 @@ void loop() {
   }
 
   unsigned long now = millis();
-  if (interval_buffer.size > 0.6 * CAPACITY || now >= nextUploadMs) {
+  // TODO upload on buffer nearing capacity
+  if (now >= nextUploadMs) {
     if (uploadSamples()) {
       nextUploadMs = now + 1000 * SYNC_PERIOD_SECONDS;
       failureCount = 0;
@@ -387,7 +416,6 @@ void loop() {
       } else if (currentScreen == Screen::CurrentAndMonth) {
         currentScreen = Screen::Hello;
       }
-      screenState.currentWatts = random(100, 10000);
       screenState.todayPounds = random(0, 300);
       screenState.todayPence = random(0, 99);
       screenState.monthPounds = random(400, 1000);
@@ -411,6 +439,17 @@ void loop() {
   if (backlightIsOn && millis() > turnBacklightOffAt) {
     backlightIsOn = false;
     lcd.noBacklight();
+  }
+
+  if (currentUpdated) {
+    currentUpdated = false;
+    if (interval_buffer.size >= 1) {
+      unsigned int newWatts = calculateCurrentPowerWatts(lastDurationUs / 1000);
+      if (newWatts != screenState.currentWatts) {
+        screenState.currentWatts = newWatts;
+        lcdPendingUpdate = true;
+      }
+    }
   }
 }
 
@@ -447,6 +486,8 @@ void ICACHE_RAM_ATTR d3Falling() {
   if (highDuration <= MAX_DURATION_MICROS || lastPulseMicros == -1) {
     if (sensorState == SensorState::Ok) {
       interval_buffer = circular_add(interval_buffer, lastPulseDurationMicros);
+      lastDurationUs = lastPulseDurationMicros;
+      currentUpdated = true;
     } else if (sensorState == SensorState::Disconnected) {
       sensorState = SensorState::Ok;
     } else if (sensorState == SensorState::Erratic) {
@@ -553,7 +594,6 @@ void lcdCurrentUsage(WifiStrength strength, const char* periodString, int watts,
   position += strlen(sepStr);
   intToString(bottomLine, 16, &position, todayPence, "--", 2);
   centerString(finalBottomLine, 16, bottomLine);
-  Serial.printf("%s|%s\n", bottomLine, finalBottomLine);
   lcdWriteWithSpecials(finalBottomLine, 0, 1);
 }
 
