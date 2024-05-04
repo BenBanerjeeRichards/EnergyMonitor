@@ -1,5 +1,6 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
 #include <WiFiManager.h>
 #include "config.h"
 #include "FS.h"
@@ -408,6 +409,11 @@ bool refresh() {
   // dynamic string - hopefully not an issue for heap fragmentation
   http.getString().toCharArray(refreshStr, REFRESH_SIZE);
   parseResponse(&refreshResult, refreshStr);
+
+  if (strlen(refreshResult.updateUrl) > 0) {
+    performOta();
+  }
+
   return true;
 }
 
@@ -621,7 +627,7 @@ void lcdConnectingToWifi(char* ssid) {
 void lcdHello() {
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("     Hello");
+  lcd.print("     Updated!");
 
   lcd.setCursor(0, 1);
   char bottom[16];
@@ -760,4 +766,50 @@ void lcdRenderLoop() {
       break;
   }
   lcdPendingUpdate = false;
+}
+
+void otaStarted() {
+  Serial.println("OTA started");
+}
+ 
+void otaFinished() {
+  Serial.println("OTA completed");
+}
+ 
+void otaProgress(int cur, int total) {
+  Serial.printf("OTA update at %d of %d bytes...\n", cur, total);
+  if (total != 0) {
+    currentScreen = Screen::Updating;
+    screenState.updatePercent = 100 * (1.0 * cur / total);
+    lcdPendingUpdate = true;
+    lcdRenderLoop();  // Have to call this as outside of main loop
+  }
+}
+ 
+void otaFailed(int err) {
+  Serial.printf("OTA update fatal error code %d\n", err);
+  currentScreen = Screen::Error;
+  screenState.error = Error::UpdateFailed;
+  lcdPendingUpdate = true;
+}
+
+
+void performOta() {
+  if (strlen(refreshResult.updateUrl) <= 0) {
+    Serial.println("Skipping OTA update as no updateUrl provided");
+    return;
+  }
+
+  ESPhttpUpdate.onStart(otaStarted);
+  ESPhttpUpdate.onEnd(otaFinished);
+  ESPhttpUpdate.onProgress(otaProgress);
+  ESPhttpUpdate.onError (otaFailed);
+  ESPhttpUpdate.rebootOnUpdate(false);
+
+  HTTPUpdateResult otaRet = ESPhttpUpdate.update(client, refreshResult.updateUrl);
+  if (otaRet == HTTP_UPDATE_OK) {
+    ESP.restart();
+  } else {
+    Serial.println("OTA failed");
+  }
 }

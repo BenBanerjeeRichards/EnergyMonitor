@@ -98,6 +98,7 @@ func main() {
 	const host = "192.168.1.12:8090"
 	http.HandleFunc("/v1/sync", uploadSync)
 	http.HandleFunc("/v1/refresh", refresh)
+	http.HandleFunc("/v1/firmware/50a867be", serveFirmware)
 
 	fmt.Printf("Running on http://%s\n", host)
 	http.ListenAndServe(host, nil)
@@ -123,4 +124,8 @@ func uploadSync(w http.ResponseWriter, req *http.Request) {
 
 func refresh(w http.ResponseWriter, req *http.Request) {
 	io.WriteString(w, "updateUrl=http://192.168.1.12:8090/v1/firmware/50a867be")
+}
+
+func serveFirmware(w http.ResponseWriter, req *http.Request) {
+	http.ServeFile(w, req, "EnergyMonitorESP.ino.bin")
 }
