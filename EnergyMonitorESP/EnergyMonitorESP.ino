@@ -57,8 +57,12 @@ char uploadStr[UPLOAD_BUFFER_SIZE] = "";
 unsigned long nextUploadMs = 1000 * SYNC_PERIOD_SECONDS;
 unsigned int failureCount = 0;
 
-unsigned const int REFRESH_AFTER_SYNC_PERIOD_MS = 2000;
+const unsigned int REFRESH_AFTER_SYNC_PERIOD_MS = 2000;
 unsigned long nextRefresh = 1000000;
+
+// Update LCD this frequently with percent progress
+const unsigned long OTA_LCD_REFRESH_PERIOD_MS = 1000;
+unsigned long otaNextUpdateMs = 0;
 
 // Update wifi stength info
 const unsigned int WIFI_STATUS_UPDATE_PERIOD_MS = 5000;
@@ -86,7 +90,8 @@ enum class Screen {
   CurrentAndDay,     // Show current usage in W and the total used this day
   CurrentAndMonth,   // Same as above, but show the billing period (month)
   Error,             // Display an error code
-  Updating           // OTA update progress
+  Updating,          // OTA update progress
+  UpdateOk           // Shown on LCD before restart
 };
 
 Screen currentScreen = Screen::Hello;  // Current screen to be dislpayed
@@ -737,6 +742,17 @@ void lcdWriteWithSpecials(char* string, int startCol, int row) {
   }
 }
 
+void lcdUpdateOk() {
+  char line[17];
+  strcpy(line, "    Update OK");
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line);
+  strcpy(line, "  Restarting...");
+  lcd.setCursor(0, 1);
+  lcd.print(line);
+}
+
 
 void lcdRenderLoop() {
   if (!lcdPendingUpdate) {
@@ -764,16 +780,24 @@ void lcdRenderLoop() {
     case Screen::Updating:
       lcdUpdating(screenState.updatePercent);
       break;
+    case Screen::UpdateOk:
+      lcdUpdateOk();
+      break;
+
   }
   lcdPendingUpdate = false;
 }
 
 void otaStarted() {
   Serial.println("OTA started");
+  otaNextUpdateMs = millis();
 }
  
 void otaFinished() {
   Serial.println("OTA completed");
+  currentScreen = Screen::UpdateOk;
+  lcdPendingUpdate = true;
+  lcdRenderLoop();
 }
  
 void otaProgress(int cur, int total) {
@@ -781,8 +805,13 @@ void otaProgress(int cur, int total) {
   if (total != 0) {
     currentScreen = Screen::Updating;
     screenState.updatePercent = 100 * (1.0 * cur / total);
-    lcdPendingUpdate = true;
-    lcdRenderLoop();  // Have to call this as outside of main loop
+
+    // Don't update the lcd too often - otherwise not legible due to slow refresh time
+    if (screenState.updatePercent > 95 || millis() > otaNextUpdateMs) {
+      lcdPendingUpdate = true;
+      lcdRenderLoop();  // Have to call this as ota blocks main loop
+      otaNextUpdateMs = millis() + OTA_LCD_REFRESH_PERIOD_MS;
+    }
   }
 }
  
@@ -808,6 +837,7 @@ void performOta() {
 
   HTTPUpdateResult otaRet = ESPhttpUpdate.update(client, refreshResult.updateUrl);
   if (otaRet == HTTP_UPDATE_OK) {
+    delay(500);  // Give time to read LCD
     ESP.restart();
   } else {
     Serial.println("OTA failed");
