@@ -39,9 +39,7 @@ int normalityCount = 0;                               // When in erratic mode, h
 SensorState sensorState = SensorState::Disconnected;  // Disconnected until proven otherwise
 
 // Button debounce and state
-const int DEBOUNCE_THRESH_MS = 150;            // Any inputs in this period are ignored
 bool btn1Pressed = false;                      // becomes true until button press event handled
-volatile unsigned long btn1LastPressedMs = 0;  // For software debounce
 
 // State for pulsing LED
 const unsigned int PULSE_INTERVAL_MS = 50;
@@ -345,7 +343,7 @@ void setup() {
   pinMode(PIN_PULSE, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_D3, INPUT_PULLUP);
-  pinMode(PIN_BTN_1, INPUT_PULLUP);
+  pinMode(PIN_BTN_1, INPUT);
 
   WiFiManager wifiManager;
   wifiManager.getWiFiSSID(true).toCharArray(screenState.connectingSSID, 32);
@@ -369,7 +367,7 @@ void setup() {
   digitalWrite(PIN_LED, HIGH);
 
   attachInterrupt(digitalPinToInterrupt(PIN_D3), ISR_D3_change, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(PIN_BTN_1), ISR_D6_high, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_1), ISR_D6_high, RISING);
 
   randomSeed(analogRead(0));
   interval_buffer = circular_init();
@@ -601,11 +599,7 @@ void ICACHE_RAM_ATTR ISR_D3_change() {
 
 
 void ICACHE_RAM_ATTR ISR_D6_high() {
-  unsigned long now = millis();
-  if (now - btn1LastPressedMs > DEBOUNCE_THRESH_MS) {
-    btn1Pressed = true;
-    btn1LastPressedMs = now;  // Time debounce from trigger
-  }
+  btn1Pressed = true;
 }
 
 void lcdConnectingToWifi() {
