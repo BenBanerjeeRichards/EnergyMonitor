@@ -35,3 +35,20 @@ void centerString(char* outputString, int width, char* stringToCenter) {
   }
   strlcpy(outputString+leftPad, stringToCenter, width);
 }
+
+
+int startsWith(char* prefix, char* str) {
+    return strncmp(prefix, str, strlen(prefix)) == 0;
+}
+
+void readUntilNewline(char* str, int* position, char* value, int valueLength) {
+    for (int i = 0; i < valueLength; i++) {
+        char ch = str[*position +i];
+        if (ch == '\0' || ch == '\n') {
+            value[i] = '\0';
+            *position += (i + 1);
+            break;
+        } 
+        value[i] = ch;
+    }
+}

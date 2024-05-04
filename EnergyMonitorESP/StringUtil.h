@@ -7,4 +7,8 @@ int intToString(char* string, int stringSize, int* stringOffset, int number, con
 
 void centerString(char* outputString, int width, char* stringToCenter);
 
+int startsWith(char* prefix, char* str);
+
+void readUntilNewline(char* str, int* position, char* value, int valueLength);
+
 #endif 

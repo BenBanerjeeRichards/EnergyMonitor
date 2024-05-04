@@ -97,6 +97,7 @@ func parseSyncRequest(timestamp int64, requestStr string) (SyncData, error) {
 func main() {
 	const host = "192.168.1.12:8090"
 	http.HandleFunc("/v1/sync", uploadSync)
+	http.HandleFunc("/v1/refresh", refresh)
 
 	fmt.Printf("Running on http://%s\n", host)
 	http.ListenAndServe(host, nil)
@@ -118,4 +119,8 @@ func uploadSync(w http.ResponseWriter, req *http.Request) {
 			fmt.Printf("%+v\n", syncData)
 		}
 	}
+}
+
+func refresh(w http.ResponseWriter, req *http.Request) {
+	io.WriteString(w, "updateUrl=http://192.168.1.12:8090/v1/firmware/50a867be")
 }

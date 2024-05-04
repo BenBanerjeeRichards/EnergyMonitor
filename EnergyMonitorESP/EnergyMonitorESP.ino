@@ -8,6 +8,9 @@
 #include "Circular.h"
 #include "StringUtil.h"
 
+// Refresh string from server
+#define REFRESH_SIZE 512
+
 const int UPLOAD_BUFFER_SIZE = 14 * CAPACITY;
 
 
@@ -24,18 +27,20 @@ volatile unsigned long lastPulseDurationMicros = -1;
 // More than 200ms at high indicates erratic measurements - e.g. sensor not attached to meter
 // If this occurs, wait for a number of normal measurements until we resume operations
 // Note that these normality measurements are discarded even if we return to OK
-enum class SensorState {Ok, Erratic, Disconnected}; 
+enum class SensorState { Ok,
+                         Erratic,
+                         Disconnected };
 
 const unsigned long MAX_DURATION_MICROS = 200 * 1000;
-const unsigned int RETURN_TO_NORMALITY_TRESH = 3; // Wait for this number of normal measurements until OK
-bool hasBeenErratic = false;                      // Have we been erratic in this sync period? Set so we can notify API
-int normalityCount = 0;                           // When in erratic mode, how many consequative OK measurements have we had
-SensorState sensorState = SensorState::Disconnected;       // Disconnected until proven otherwise
+const unsigned int RETURN_TO_NORMALITY_TRESH = 3;     // Wait for this number of normal measurements until OK
+bool hasBeenErratic = false;                          // Have we been erratic in this sync period? Set so we can notify API
+int normalityCount = 0;                               // When in erratic mode, how many consequative OK measurements have we had
+SensorState sensorState = SensorState::Disconnected;  // Disconnected until proven otherwise
 
-// Button debounce and state 
-const int DEBOUNCE_THRESH_MS = 150;        // Any inputs in this period are ignored 
-bool btn1Pressed = false;                           // becomes true until button press event handled 
-volatile unsigned long btn1LastPressedMs = 0;       // For software debounce
+// Button debounce and state
+const int DEBOUNCE_THRESH_MS = 150;            // Any inputs in this period are ignored
+bool btn1Pressed = false;                      // becomes true until button press event handled
+volatile unsigned long btn1LastPressedMs = 0;  // For software debounce
 
 // State for pulsing LED
 const unsigned int PULSE_INTERVAL_MS = 50;
@@ -51,33 +56,42 @@ char uploadStr[UPLOAD_BUFFER_SIZE] = "";
 unsigned long nextUploadMs = 1000 * SYNC_PERIOD_SECONDS;
 unsigned int failureCount = 0;
 
-// Update wifi stength info 
+unsigned const int REFRESH_AFTER_SYNC_PERIOD_MS = 2000;
+unsigned long nextRefresh = 1000000;
+
+// Update wifi stength info
 const unsigned int WIFI_STATUS_UPDATE_PERIOD_MS = 5000;
 unsigned long nextCheckWifiStatusAt = 0;
 
 enum class WifiStrength {
-  VeryGood, Good, Ok, Poor, Disconnected
+  VeryGood,
+  Good,
+  Ok,
+  Poor,
+  Disconnected
 };
 
 enum class Error {
   ErraticSensor,
   UploadMem,
+  UpdateFailed
 };
 
-// State for rendering to the display 
-enum class Screen { 
-  Hello, 
-  ConnectToAp,        // Instruct user to connect to the AP for setup
-  ConnectingToWifi,   // Connecting to a specific (already saved) AP
-  CurrentAndDay,      // Show current usage in W and the total used this day 
-  CurrentAndMonth,    // Same as above, but show the billing period (month)
-  Error               // Display an error code 
+// State for rendering to the display
+enum class Screen {
+  Hello,
+  ConnectToAp,       // Instruct user to connect to the AP for setup
+  ConnectingToWifi,  // Connecting to a specific (already saved) AP
+  CurrentAndDay,     // Show current usage in W and the total used this day
+  CurrentAndMonth,   // Same as above, but show the billing period (month)
+  Error,             // Display an error code
+  Updating           // OTA update progress
 };
 
-Screen currentScreen = Screen::Hello;   // Current screen to be dislpayed
-bool lcdPendingUpdate = true;              // true when we are pending an update to lcd display
+Screen currentScreen = Screen::Hello;  // Current screen to be dislpayed
+bool lcdPendingUpdate = true;          // true when we are pending an update to lcd display
 // Actual data to be rendered to the screen. Big struct contains data for all possible screens
-// Responsibility for the rest of the code to ensure that the state exists for the currentScreen 
+// Responsibility for the rest of the code to ensure that the state exists for the currentScreen
 struct screen_state_t {
   int buttonCount;  // debug
   // ConnectingToWifi
@@ -92,9 +106,12 @@ struct screen_state_t {
   // Month
   int monthPounds;
   int monthPence;
-  
+
   // Error
   Error error;
+
+  // Updating
+  int updatePercent;
 };
 
 // Backlight - turn off when inactive
@@ -113,6 +130,9 @@ const char* errorCode(Error error) {
   if (error == Error::ErraticSensor) {
     return "E21";
   }
+  if (error == Error::UpdateFailed) {
+    return "E22";
+  }
   return "E??";
 }
 
@@ -124,8 +144,14 @@ const char* errorMessage(Error error) {
   if (error == Error::UploadMem) {
     return "Upload memory";
   }
+  if (error == Error::UpdateFailed) {
+    return "Update failed";
+  }
+
   return "Unknown";
 }
+
+WiFiClient client;
 
 Error error;
 boolean activeError = false;
@@ -147,58 +173,58 @@ void clearError() {
 }
 
 byte poundLcdChar[8] = {
-		0b01111,
-	0b01000,
-	0b01000,
-	0b11110,
-	0b01000,
-	0b01000,
-	0b11111,
-	0b00000
+  0b01111,
+  0b01000,
+  0b01000,
+  0b11110,
+  0b01000,
+  0b01000,
+  0b11111,
+  0b00000
 };
 
-byte wifiStrenghVeryGoodChar[8] {
-	0b00000,
-	0b00000,
-	0b00001,
-	0b00011,
-	0b00111,
-	0b01111,
-	0b11111,
-	0b00000
+byte wifiStrenghVeryGoodChar[8]{
+  0b00000,
+  0b00000,
+  0b00001,
+  0b00011,
+  0b00111,
+  0b01111,
+  0b11111,
+  0b00000
 };
 
 byte wifiStrenghGoodChar[8] = {
-	0b00000,
-	0b00000,
-	0b00000,
-	0b00010,
-	0b00110,
-	0b01110,
-	0b11110,
-	0b00000
+  0b00000,
+  0b00000,
+  0b00000,
+  0b00010,
+  0b00110,
+  0b01110,
+  0b11110,
+  0b00000
 };
 
 byte wifiStrenghOkChar[8] = {
-	0b00000,
-	0b00000,
-	0b00000,
-	0b00000,
-	0b00100,
-	0b01100,
-	0b11100,
-	0b00000
+  0b00000,
+  0b00000,
+  0b00000,
+  0b00000,
+  0b00100,
+  0b01100,
+  0b11100,
+  0b00000
 };
 
 byte wifiStrenghPoorChar[8] = {
-	0b00000,
-	0b00000,
-	0b00000,
-	0b00000,
-	0b00000,
-	0b01000,
-	0b11000,
-	0b00000
+  0b00000,
+  0b00000,
+  0b00000,
+  0b00000,
+  0b00000,
+  0b01000,
+  0b11000,
+  0b00000
 };
 
 const int LCD_CUSTOM_POUND = 0;
@@ -217,9 +243,19 @@ struct circular_buffer interval_buffer;
 unsigned long lastDurationUs = 0;
 bool currentUpdated = false;
 
-WifiStrength getWiFiStrength();
+struct refresh_result_t {
+  // If this is set, then we are sending an update
+  char updateUrl[64];
+};
 
-LiquidCrystal_I2C lcd(LCD_ADDR, 16,2); 
+struct refresh_result_t refreshResult;
+char refreshStr[REFRESH_SIZE];  // String from server for data refresh
+
+WifiStrength getWiFiStrength();
+void parseResponse(struct refresh_result_t* response, char* response_str);
+bool refresh();
+
+LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
 
 void turnOnBacklight() {
   if (!backlightIsOn) {
@@ -229,56 +265,56 @@ void turnOnBacklight() {
   turnBacklightOffAt = millis() + BACKLIGHT_TIMEOUT_MS;
 }
 
-void append(int *idx, const char* toAppend) {
-    strlcpy(uploadStr+*idx, toAppend, UPLOAD_BUFFER_SIZE);
-    *idx += strlen(toAppend);
+void append(int* idx, const char* toAppend) {
+  strlcpy(uploadStr + *idx, toAppend, UPLOAD_BUFFER_SIZE);
+  *idx += strlen(toAppend);
 }
 
 void writeKeyValue(int* idx, const char* key, const char* val) {
-    append(idx, key);
-    append(idx, "=");
-    append(idx, val);
-    append(idx, ";");
+  append(idx, key);
+  append(idx, "=");
+  append(idx, val);
+  append(idx, ";");
 }
 
 void writeStateToUploadString() {
-    char numberStr[15];     // Buffer for conversion from int -> string
-    int writeIndex = 0;   // Current location in global uploadStr we are at 
-    writeKeyValue(&writeIndex,"version", VERSION);
-    writeKeyValue(&writeIndex,"tenantId", TENANT_ID);
+  char numberStr[15];  // Buffer for conversion from int -> string
+  int writeIndex = 0;  // Current location in global uploadStr we are at
+  writeKeyValue(&writeIndex, "version", VERSION);
+  writeKeyValue(&writeIndex, "tenantId", TENANT_ID);
 
-    sprintf(numberStr, "%d", WiFi.RSSI());
-    writeKeyValue(&writeIndex,"rssi", numberStr);
+  sprintf(numberStr, "%d", WiFi.RSSI());
+  writeKeyValue(&writeIndex, "rssi", numberStr);
 
-    const char* sensorStateStr = "ok";
-    if (sensorState == SensorState::Ok) {
-      sensorStateStr = "ok";
-    } else if (sensorState == SensorState::Disconnected) {
-      sensorStateStr = "discon";
-    } else if (sensorState == SensorState::Erratic || hasBeenErratic) {
-      hasBeenErratic = false; // Reset for next sync period
-      sensorStateStr = "erratic";
+  const char* sensorStateStr = "ok";
+  if (sensorState == SensorState::Ok) {
+    sensorStateStr = "ok";
+  } else if (sensorState == SensorState::Disconnected) {
+    sensorStateStr = "discon";
+  } else if (sensorState == SensorState::Erratic || hasBeenErratic) {
+    hasBeenErratic = false;  // Reset for next sync period
+    sensorStateStr = "erratic";
+  }
+
+  writeKeyValue(&writeIndex, "sensor", sensorStateStr);
+  sprintf(numberStr, "%d", interval_buffer.size);
+  writeKeyValue(&writeIndex, "size", numberStr);
+  append(&writeIndex, "values=");
+  for (int i = 0; i < interval_buffer.size; i++) {
+    sprintf(numberStr, "%d", circular_get(interval_buffer, i));
+    append(&writeIndex, numberStr);
+    append(&writeIndex, ",");
+
+    if (writeIndex > UPLOAD_BUFFER_SIZE - 20) {
+      // If we run out of memory in upload string, then show error and clear buffer
+      currentScreen = Screen::Error;
+      screenState.error = Error::UploadMem;
+      lcdPendingUpdate = true;
+      uploadStr[0] = '\0';
+      interval_buffer.size = 0;
+      return;
     }
-
-    writeKeyValue(&writeIndex,"sensor", sensorStateStr);
-    sprintf(numberStr, "%d", interval_buffer.size);
-    writeKeyValue(&writeIndex,"size", numberStr);
-    append(&writeIndex, "values=");
-    for (int i =0; i < interval_buffer.size; i++) {
-        sprintf(numberStr, "%d", circular_get(interval_buffer, i));
-        append(&writeIndex, numberStr);
-        append(&writeIndex, ",");
-
-        if (writeIndex > UPLOAD_BUFFER_SIZE - 20) {
-          // If we run out of memory in upload string, then show error and clear buffer 
-          currentScreen = Screen::Error;
-          screenState.error = Error::UploadMem;
-          lcdPendingUpdate = true;
-          uploadStr[0] = '\0';
-          interval_buffer.size = 0;
-          return;
-        }
-    }
+  }
 }
 
 
@@ -292,8 +328,8 @@ void setup() {
     Serial.printf(" Failed to find LCD at I2C address %d - error code: %d\n", LCD_ADDR, error);
   }
   lcd.init();
-  lcd.clear();         
-  lcd.backlight(); // Keep on for setup
+  lcd.clear();
+  lcd.backlight();  // Keep on for setup
   lcd.createChar(LCD_CUSTOM_POUND, poundLcdChar);
   lcd.createChar(LCD_CUSTOM_WIFI_VERY_STRONG, wifiStrenghVeryGoodChar);
   lcd.createChar(LCD_CUSTOM_WIFI_GOOD, wifiStrenghGoodChar);
@@ -314,12 +350,14 @@ void setup() {
     lcdPendingUpdate = true;
     lcdRenderLoop();  // Do manually here as outside main loop
   } else {
-    // TODO 
+    // TODO
   }
 
   wifiManager.setConfigPortalTimeout(600);
   wifiManager.autoConnect(AP_SSID, AP_PASS);
   currentScreen = Screen::Hello;
+
+  screenState.updatePercent = 56;
   lcdPendingUpdate = true;
 
   digitalWrite(PIN_LED, HIGH);
@@ -330,7 +368,7 @@ void setup() {
   randomSeed(analogRead(0));
   interval_buffer = circular_init();
   turnOnBacklight();  // Now setup complete, set backlight on timer
-  Serial.println("Setpu completed");
+  Serial.println("Setup completed");
 }
 
 bool uploadSamples() {
@@ -339,24 +377,50 @@ bool uploadSamples() {
   writeStateToUploadString();
   interrupts();
 
-  Serial.printf("Uploading samples %d\n", interval_buffer.size);
-       
-  WiFiClient client;
+  Serial.printf("Uploading samples %d to %s\n", interval_buffer.size, SYNC_ENDPOINT);
+
   HTTPClient http;
   http.begin(client, SYNC_ENDPOINT);
   int resp = http.PUT(uploadStr);
   Serial.printf("Upload HTTP response code %d\n", resp);
   http.end();
-  int success =  resp >= 200 && resp <= 299;
+  int success = resp >= 200 && resp <= 299;
   if (success) {
-    // If uploaded ok, then remove from circular buffer by removing count 
+    // If uploaded ok, then remove from circular buffer by removing count
     // This ensure that any written during upload will still be kept
     noInterrupts();
     const int newSize = interval_buffer.size - numToUpload;
-    interval_buffer.size = newSize <= 0 ? 0 : newSize;  // Should not be negative, but good to check 
+    interval_buffer.size = newSize <= 0 ? 0 : newSize;  // Should not be negative, but good to check
     interrupts();
   }
   return success;
+}
+
+bool refresh() {
+  HTTPClient http;
+  http.begin(client, REFRESH_ENDPOINT);
+  int resp = http.GET();
+  Serial.printf("Refresh endpoint returned status %d\n", resp);
+  if (resp != 200) {
+    return false;
+  }
+
+  // dynamic string - hopefully not an issue for heap fragmentation
+  http.getString().toCharArray(refreshStr, REFRESH_SIZE);
+  parseResponse(&refreshResult, refreshStr);
+  return true;
+}
+
+void parseResponse(struct refresh_result_t* response, char* response_str) {
+  int position = 0;
+  while (position < strlen(response_str)) {
+    if (startsWith("updateUrl=", response_str + position)) {
+      position += strlen("updateUrl=");
+      readUntilNewline(response_str, &position, response->updateUrl, 64);
+    } else {
+      break;
+    }
+  }
 }
 
 int calculateCurrentPowerWatts(int periodMs) {
@@ -393,12 +457,24 @@ void loop() {
     if (uploadSamples()) {
       nextUploadMs = now + 1000 * SYNC_PERIOD_SECONDS;
       failureCount = 0;
-      
+
     } else {
       // On failure, retry sooner - just do multiplicative backoff capped at 5s
       failureCount += 1;
       const int backoffCount = failureCount > 10 ? failureCount : failureCount;
       nextUploadMs = millis() + (backoffCount * 500);
+    }
+    nextRefresh = (unsigned long)millis() + REFRESH_AFTER_SYNC_PERIOD_MS;
+  }
+
+  if (now >= nextRefresh) {
+    Serial.println("Refreshing");
+    nextRefresh = (unsigned long)millis() + 100000000;
+    if (refresh()) {
+      Serial.printf("Refresh OK! updateUrl=%s\n", refreshResult.updateUrl);
+    } else {
+      // TODO
+      Serial.printf("Refresh failed!\n");
     }
   }
 
@@ -477,7 +553,7 @@ void ICACHE_RAM_ATTR d3Rising() {
   lastPulseDurationMicros = now - lastPulseMicros;
   lastPulseMicros = now;
 }
- 
+
 
 void ICACHE_RAM_ATTR d3Falling() {
   // Check duration pulse was high for
@@ -523,33 +599,33 @@ void ICACHE_RAM_ATTR ISR_D6_high() {
 
 void lcdConnectingToWifi() {
   lcd.clear();
-  lcd.setCursor(1,0);   
+  lcd.setCursor(1, 0);
   lcd.print("Connecting to");
-  lcd.setCursor(6,1);   
+  lcd.setCursor(6, 1);
   lcd.print("WiFi");
 }
 
 
 void lcdConnectingToWifi(char* ssid) {
   lcd.clear();
-  lcd.setCursor(0,0);
+  lcd.setCursor(0, 0);
   lcd.print(" Connecting to");
 
   clampString(ssid, 16);
   char bottomLine[17];
   centerString(bottomLine, 16, ssid);
-  lcd.setCursor(0,1);
+  lcd.setCursor(0, 1);
   lcd.print(bottomLine);
 }
 
 void lcdHello() {
   lcd.clear();
-  lcd.setCursor(0,0);
+  lcd.setCursor(0, 0);
   lcd.print("     Hello");
 
   lcd.setCursor(0, 1);
   char bottom[16];
-  int x =0 ;
+  int x = 0;
   intToString(bottom, 16, &x, screenState.buttonCount, "--", 10);
   lcd.print(bottom);
 }
@@ -572,13 +648,13 @@ void lcdCurrentUsage(WifiStrength strength, const char* periodString, int watts,
   char topLine[16];
   char finalTopLine[17];
   int position = 0;
-  strlcpy(topLine+position, "Now ", 15);
+  strlcpy(topLine + position, "Now ", 15);
   position += 4;
   intToString(topLine, 15, &position, watts, ">99999", 5);
-  strlcpy(topLine+position, "W", 15);
+  strlcpy(topLine + position, "W", 15);
   centerString(finalTopLine, 15, topLine);
   lcd.clear();
-  lcd.setCursor(0,0);
+  lcd.setCursor(0, 0);
   lcd.write(specialCharForWifiStrength(strength));
   lcd.print(finalTopLine);
 
@@ -586,11 +662,11 @@ void lcdCurrentUsage(WifiStrength strength, const char* periodString, int watts,
   char finalBottomLine[17];
   strcpy(bottomLine, periodString);
   position = strlen(periodString);
-  strcpy(bottomLine+position, " \243");
+  strcpy(bottomLine + position, " \243");
   position += 2;
   intToString(bottomLine, 16, &position, todayPounds, "---", 4);
   const char* sepStr = todayPence < 10 ? ".0" : ".";
-  strcpy(bottomLine+position, sepStr);
+  strcpy(bottomLine + position, sepStr);
   position += strlen(sepStr);
   intToString(bottomLine, 16, &position, todayPence, "--", 2);
   centerString(finalBottomLine, 16, bottomLine);
@@ -614,7 +690,7 @@ void lcdConnectToAP() {
 void lcdError(Error error) {
   char topLine[17];
   strcpy(topLine, "ERROR           ");
-  strncpy(topLine+13, errorCode(error), 3);
+  strncpy(topLine + 13, errorCode(error), 3);
   char bottomLine[17];
   strncpy(bottomLine, errorMessage(error), 16);
   lcd.clear();
@@ -624,14 +700,31 @@ void lcdError(Error error) {
   lcd.print(bottomLine);
 }
 
+void lcdUpdating(int updatePercent) {
+  char topLine[17];
+  strcpy(topLine, "   Updating...");
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(topLine);
+  char numStr[3];
+  int position = 0;
+  char bottomLine[17];
+  intToString(bottomLine, 16, &position, updatePercent, "??", 3);
+  strcpy(bottomLine + position, "%");
+  char finalBottomLine[17];
+  centerString(finalBottomLine, 16, bottomLine);
+  lcd.setCursor(0, 1);
+  lcd.print(finalBottomLine);
+}
+
 void lcdWriteWithSpecials(char* string, int startCol, int row) {
   char tmp[2];
-  for (int col = startCol; col < strlen(string)+startCol; col++) {
+  for (int col = startCol; col < strlen(string) + startCol; col++) {
     lcd.setCursor(col, row);
     if (string[col] == '\243') {
       lcd.write(LCD_CUSTOM_POUND);
     } else {
-      strncpy(tmp, string+col, 1);
+      strncpy(tmp, string + col, 1);
       tmp[1] = '\0';
       lcd.print(tmp);
     }
@@ -662,7 +755,9 @@ void lcdRenderLoop() {
     case Screen::Error:
       lcdError(screenState.error);
       break;
-
+    case Screen::Updating:
+      lcdUpdating(screenState.updatePercent);
+      break;
   }
   lcdPendingUpdate = false;
 }
