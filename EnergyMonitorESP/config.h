@@ -2,7 +2,7 @@
 // configured by user using wifimanager or pushed via web
 
 #define VERSION "v0.0.1"
-#define TENANT_ID "ben"
+#define TENANT_ID "dev"
 #define SYNC_ENDPOINT "http://192.168.1.12:8090/v1/sync"
 #define REFRESH_ENDPOINT "http://192.168.1.12:8090/v1/refresh"
 #define SYNC_PERIOD_SECONDS 20
