@@ -1,7 +1,6 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266httpUpdate.h>
-#include <LittleFS.h>
 #include "Fs.h"
 #include <WiFiManager.h>
 #include "config.h"
@@ -10,6 +9,9 @@
 #include <Wire.h>
 #include "Circular.h"
 #include "StringUtil.h"
+#include <errno.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
 
 // Refresh string from server
 #define REFRESH_SIZE 512
@@ -21,6 +23,7 @@ const int PIN_PULSE = 14;
 const int PIN_D3 = SENSOR_PIN;
 const int PIN_LED = 2;  // internal LED
 const int PIN_BTN_1 = 12;
+const int PIN_BTN_2 = 14;
 
 // State for tracking pulses
 volatile unsigned long lastPulseMicros = -1;
@@ -41,6 +44,7 @@ SensorState sensorState = SensorState::Disconnected;  // Disconnected until prov
 
 // Button debounce and state
 bool btn1Pressed = false;  // becomes true until button press event handled
+bool btn2Pressed = false;  // becomes true until button press event handled
 
 // State for pulsing LED
 const unsigned int PULSE_INTERVAL_MS = 50;
@@ -67,32 +71,8 @@ unsigned long otaNextUpdateMs = 0;
 const unsigned int WIFI_STATUS_UPDATE_PERIOD_MS = 5000;
 unsigned long nextCheckWifiStatusAt = 0;
 
-// Config keys
-const char* CFG_SECRET = "secret";
-const char* CFG_SENSOR_ID = "sensorId";
-const char* CFG_ENDPOINT = "endpoint";
-const char* CFG_SYNC_ROUTE = "syncRoute";
-const char* CFG_REFRESH_ROUTE = "refreshRoute";
-const char* CFG_REFRESH_PERIOD = "refreshPeriod";  // In seconds
-const char* CFG_IMPL_PER_KWH = "impulseKwh";
-
-const int CFG_SIZE_SECRET= 256;
-const int CFG_SIZE_SENSOR_ID = 16;
-const int CFG_SIZE_ENDPOINT = 32;
-const int CFG_SIZE_SYNC_ROUTE = 32;
-const int CFG_SIZE_REFRESH_ROUTE = 32;
-const int CFG_SIZE_REFRESH_PERIOD = 16;
-const int CFG_SIZE_IMPLUSE_KWH = 16;
-
-struct config_t {
-  char secret[CFG_SIZE_SECRET];
-  char sensorId[CFG_SIZE_SENSOR_ID];
-  char endpoint[CFG_SIZE_ENDPOINT];
-  char syncRoute[CFG_SIZE_SYNC_ROUTE];
-  char refreshRoute[CFG_SIZE_REFRESH_ROUTE];
-  char refreshPeriodSeconds[CFG_SIZE_REFRESH_PERIOD];
-  char implusePerKwh[CFG_SIZE_IMPLUSE_KWH];
-};
+char syncEndpoint[256];
+char refreshEndpoint[256];
 
 int refreshPeriodSeconds = 20;
 int implusePerKwh = 0;
@@ -112,23 +92,7 @@ enum class Error {
   FileOpenRFail,
   FileOpenWFail,
   FileWriteFail,
-
-  // Config validation errors for each field
-  InvalidConfig,
-  InvalidConfigSensorId,
-  InvalidConfigSecret,
-  InvalidConfigEndpoint,
-  InvalidConfigSyncRoute,
-  InvalidConfigRefreshRoute,
-  InvalidConfigImplKwh,
-  InvalidConfigRefreshPeriod
 };
-
-bool isConfigError(Error error) {
-  return error == Error::InvalidConfig || error == Error::InvalidConfigSensorId || error == Error::InvalidConfigSecret 
-      || error == Error::InvalidConfigEndpoint || error == Error::InvalidConfigSyncRoute || error == Error::InvalidConfigRefreshRoute
-      || error == Error::InvalidConfigImplKwh || error == Error::InvalidConfigRefreshPeriod;
-}
 
 // State for rendering to the display
 enum class Screen {
@@ -174,7 +138,11 @@ bool backlightIsOn = false;
 unsigned int turnBacklightOffAt;
 
 struct screen_state_t screenState;
-struct config_t config;
+
+int TEST_KW_1 = 1000;
+int TEST_KW_2 = 10000;
+int TEST_KW_3 = 5724;
+int currentTestKw = TEST_KW_1;
 
 // Always 3 digits (EXY)
 const char* errorCode(Error error) {
@@ -195,30 +163,6 @@ const char* errorCode(Error error) {
   }
   if (error == Error::FileWriteFail) {
     return "E25";
-  }
-  if (error == Error::InvalidConfig) {
-    return "E30";
-  }
-  if (error == Error::InvalidConfigSecret) {
-    return "E31";
-  }
-  if (error == Error::InvalidConfigSensorId) {
-    return "E32";
-  }
-  if (error == Error::InvalidConfigEndpoint) {
-    return "E34";
-  }
-  if (error == Error::InvalidConfigSyncRoute) {
-    return "E35";
-  }
-  if (error == Error::InvalidConfigRefreshRoute) {
-    return "E36";
-  }
-  if (error == Error::InvalidConfigRefreshPeriod) {
-    return "E37";
-  }
-  if (error == Error::InvalidConfigImplKwh) {
-    return "E38";
   }
 
   return "E??";
@@ -244,39 +188,16 @@ const char* errorMessage(Error error) {
   if (error == Error::FileWriteFail) {
     return "File write";
   }
-  if (error == Error::InvalidConfig) {
-    return "Invalid config";
-  }
-  if (error == Error::InvalidConfigSecret) {
-    return "Cfg: secret";
-  }
-  if (error == Error::InvalidConfigSensorId) {
-    return "Cfg: sensorId";
-  }
-  if (error == Error::InvalidConfigEndpoint) {
-    return "Cfg: endpoint";
-  }
-  if (error == Error::InvalidConfigSyncRoute) {
-    return "Cfg: syncRoute";
-  }
-  if (error == Error::InvalidConfigRefreshRoute) {
-    return "Cfg: refreshRou";
-  }
-  if (error == Error::InvalidConfigRefreshPeriod) {
-    return "Cfg: refreshPer";
-  }
-  if (error == Error::InvalidConfigImplKwh) {
-    return "Cfg: implKwh";
-  }
   return "Unknown";
 }
 
 WiFiClient client;
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 3600000L);
 
 Error error;
 boolean activeError = false;
 Screen screenRestoreToAfterError;
-
 
 bool cfg_write(const char* name, char* value);
 bool cfg_read(const char* name, char* value, int maxLength);
@@ -357,10 +278,9 @@ const int LCD_CUSTOM_WIFI_GOOD = 2;
 const int LCD_CUSTOM_WIFI_OK = 3;
 const int LCD_CUSTOM_WIFI_POOR = 4;
 
-
-
 void ICACHE_RAM_ATTR ISR_D3_change();
 void ICACHE_RAM_ATTR ISR_D6_high();
+void ICACHE_RAM_ATTR ISR_D5_high();
 
 
 struct circular_buffer interval_buffer;
@@ -401,7 +321,7 @@ void writeKeyValue(int* idx, const char* key, const char* val) {
   append(idx, ";");
 }
 
-void writeStateToUploadString() {
+void writeStateToUploadString(unsigned long currentUnix) {
   char numberStr[15];  // Buffer for conversion from int -> string
   int writeIndex = 0;  // Current location in global uploadStr we are at
   writeKeyValue(&writeIndex, "version", VERSION);
@@ -409,6 +329,8 @@ void writeStateToUploadString() {
 
   sprintf(numberStr, "%d", WiFi.RSSI());
   writeKeyValue(&writeIndex, "rssi", numberStr);
+  sprintf(numberStr, "%lu", currentUnix);
+  writeKeyValue(&writeIndex, "timestamp", numberStr);
 
   const char* sensorStateStr = "ok";
   if (sensorState == SensorState::Ok) {
@@ -441,10 +363,6 @@ void writeStateToUploadString() {
   }
 }
 
-bool shouldSaveConfig = false;
-void onWifiSaveConfig() {
-  shouldSaveConfig = true;
-}
 
 void onAutoConnectFailed(WiFiManager *_wm) {
   currentScreen = Screen::ConnectToAp;
@@ -453,14 +371,8 @@ void onAutoConnectFailed(WiFiManager *_wm) {
 }
 
 void startWifiPortal(bool autoConnect) {
+  Serial.println("startWifiPortal()");
   WiFiManager wifiManager;
-  WiFiManagerParameter param_secret(CFG_SECRET, CFG_SECRET, config.secret, CFG_SIZE_SECRET);
-  WiFiManagerParameter param_sensor_id(CFG_SENSOR_ID, CFG_SENSOR_ID, config.sensorId, CFG_SIZE_SENSOR_ID);
-  WiFiManagerParameter param_endpoint(CFG_ENDPOINT, CFG_ENDPOINT, config.endpoint, CFG_SIZE_ENDPOINT);
-  WiFiManagerParameter param_sync_route(CFG_SYNC_ROUTE, CFG_SYNC_ROUTE, config.syncRoute, CFG_SIZE_SYNC_ROUTE);
-  WiFiManagerParameter param_refresh_route(CFG_REFRESH_ROUTE, CFG_REFRESH_ROUTE, config.refreshRoute, CFG_SIZE_REFRESH_ROUTE);
-  WiFiManagerParameter param_refresh_period(CFG_REFRESH_PERIOD, CFG_REFRESH_PERIOD, config.refreshPeriodSeconds, CFG_SIZE_REFRESH_PERIOD);
-  WiFiManagerParameter param_impluse_kwh(CFG_IMPL_PER_KWH, CFG_IMPL_PER_KWH, config.implusePerKwh, CFG_SIZE_IMPLUSE_KWH);
 
   if (autoConnect) {
     wifiManager.getWiFiSSID(true).toCharArray(screenState.connectingSSID, 32);
@@ -472,54 +384,20 @@ void startWifiPortal(bool autoConnect) {
     } 
   }
 
-  shouldSaveConfig = false;
-  wifiManager.setSaveConfigCallback(onWifiSaveConfig);
-
-  wifiManager.addParameter(&param_secret);
-  wifiManager.addParameter(&param_sensor_id);
-  wifiManager.addParameter(&param_endpoint);
-  wifiManager.addParameter(&param_sync_route);
-  wifiManager.addParameter(&param_refresh_route);
-  wifiManager.addParameter(&param_refresh_period);
-  wifiManager.addParameter(&param_impluse_kwh);
   wifiManager.setConfigPortalTimeout(PORTAL_TIMEOUT_SEC);
-
   wifiManager.setAPCallback(onAutoConnectFailed);
   // If autoConnect set to true, then we only show portal if connection failed
-  // Otherwise, always show the config so that the user can edit the config settings
-  if (autoConnect) {
+   if (autoConnect) {
     wifiManager.autoConnect(AP_SSID);
   } else {
     wifiManager.startConfigPortal(AP_SSID);
   }
   Serial.println("Wifi Portal done!");
-
-  if (shouldSaveConfig) {
-    strlcpy(config.secret, param_secret.getValue(), CFG_SIZE_SECRET);
-    strlcpy(config.sensorId, param_sensor_id.getValue(),CFG_SIZE_SENSOR_ID);
-    strlcpy(config.endpoint, param_endpoint.getValue(), CFG_SIZE_ENDPOINT);
-    strlcpy(config.syncRoute, param_sync_route.getValue(), CFG_SIZE_SYNC_ROUTE);
-    strlcpy(config.refreshRoute, param_refresh_route.getValue(), CFG_SIZE_REFRESH_ROUTE);
-    strlcpy(config.refreshPeriodSeconds, param_refresh_period.getValue(), CFG_SIZE_REFRESH_PERIOD);
-    strlcpy(config.implusePerKwh, param_impluse_kwh.getValue(), CFG_SIZE_IMPLUSE_KWH);
-    Serial.printf("Writing config to flash\n");
-    writeConfig(config);
-  }
-
-  Error validateError = Error::InvalidConfig;
-  if (validateConfig(config, &validateError)) {
-    currentScreen = Screen::Hello;
-  }
-
 }
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
   Serial.println("Starting setup");
-
-  if (!LittleFS.begin()) {
-    LittleFS.format();
-  }
 
   Wire.begin();
   Wire.beginTransmission(LCD_ADDR);
@@ -538,20 +416,14 @@ void setup() {
 
   pinMode(PIN_PULSE, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
-  pinMode(PIN_D3, INPUT_PULLUP);
+  pinMode(PIN_D3, INPUT);
   pinMode(PIN_BTN_1, INPUT);
-  currentScreen = Screen::Hello;
 
-  config = loadConfig();
-  Error validateError;
-  if (!validateConfig(config, &validateError)) {
-    Serial.println("Invalid config");
-    currentScreen = Screen::Error;
-    screenState.error = validateError;
-    lcdPendingUpdate = true;
-  } else {
-    startWifiPortal(true);
+  if (!TEST_MODE) {
+      pinMode(PIN_BTN_2, INPUT);
   }
+
+  startWifiPortal(true);
 
   lcdPendingUpdate = true;
 
@@ -559,18 +431,27 @@ void setup() {
 
   attachInterrupt(digitalPinToInterrupt(PIN_D3), ISR_D3_change, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_BTN_1), ISR_D6_high, RISING);
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN_2), ISR_D5_high, RISING);
 
   randomSeed(analogRead(0));
   interval_buffer = circular_init();
   turnOnBacklight();  // Now setup complete, set backlight on timer
   nextUploadMs = 1000 * SYNC_PERIOD_SECONDS;
+
+  Serial.println("Syncing time");
+  timeClient.begin();
+  timeClient.update();
+
   Serial.println("Setup completed");
+  currentScreen = Screen::CurrentAndDay;
 }
 
 bool uploadSamples() {
+  if (TEST_MODE) return true;
+  unsigned long currentUnix = timeClient.getEpochTime();
   noInterrupts();
   unsigned int numToUpload = interval_buffer.size;
-  writeStateToUploadString();
+  writeStateToUploadString(currentUnix);
   interrupts();
   Serial.printf("Uploading samples %d to %s\n", interval_buffer.size, SYNC_ENDPOINT);
 
@@ -632,32 +513,15 @@ int calculateCurrentPowerWatts(int periodMs) {
 }
 
 void loop() {
+  timeClient.update(); // time updates every hour
   lcdRenderLoop();
-  unsigned long currentMillis = millis();
-  unsigned long diff = currentMillis - prevMillis;
-  if (diff >= nextInterval) {
-    if (ledState == STATE_LED_ON) {
-      digitalWrite(PIN_LED, LOW);
-      digitalWrite(PIN_PULSE, LOW);
-      nextInterval = random(500, 3000);
-      ledState = STATE_LED_OFF;
-      Serial.printf("LED off for %d\n", nextInterval + PULSE_INTERVAL_MS);
-    } else if (ledState == STATE_LED_OFF) {
-      digitalWrite(PIN_LED, HIGH);
-      digitalWrite(PIN_PULSE, HIGH);
-      nextInterval = PULSE_INTERVAL_MS;
-      ledState = STATE_LED_ON;
-    }
-    prevMillis = millis();
-  }
-
+  testLoop();
   unsigned long now = millis();
   // TODO upload on buffer nearing capacity
   if (now >= nextUploadMs) {
     if (uploadSamples()) {
       nextUploadMs = now + 1000 * SYNC_PERIOD_SECONDS;
       failureCount = 0;
-
     } else {
       // On failure, retry sooner - just do multiplicative backoff capped at 5s
       failureCount += 1;
@@ -667,7 +531,7 @@ void loop() {
     nextRefresh = (unsigned long)millis() + REFRESH_AFTER_SYNC_PERIOD_MS;
   }
 
-  if (now >= nextRefresh) {
+  if (now >= nextRefresh && !TEST_MODE) {
     Serial.println("Refreshing");
     nextRefresh = (unsigned long)millis() + 100000000;
     if (refresh()) {
@@ -685,21 +549,25 @@ void loop() {
     lcdPendingUpdate = true;
     // Only move screen if backlgiht is on - o/w first press should only turn backlight on
     if (backlightIsOn) {
-      if (currentScreen == Screen::Hello) {
+      if (currentScreen == Screen::Hello || currentScreen == Screen::CurrentAndMonth) {
         currentScreen = Screen::CurrentAndDay;
       } else if (currentScreen == Screen::CurrentAndDay) {
         currentScreen = Screen::CurrentAndMonth;
-      } else if (currentScreen == Screen::CurrentAndMonth) {
-        currentScreen = Screen::Hello;
       } else if (currentScreen == Screen::Error) {
-        // TODO Need to determine what to do with each error 
-        if (isConfigError(screenState.error)) {
-          currentScreen = Screen::ConnectToAp;
-          lcdPendingUpdate = true;
-          lcdRenderLoop();
-          startWifiPortal(false);
-        }
+        // TODO 
       }
+
+      if (TEST_MODE) {
+        if (currentTestKw == TEST_KW_1) {
+          currentTestKw = TEST_KW_2;
+        } else if (currentTestKw == TEST_KW_2) {
+          currentTestKw = TEST_KW_3;
+        } else if (currentTestKw == TEST_KW_3) {
+          currentTestKw = TEST_KW_1;
+        }
+        Serial.printf("New Test KW: %d\n", currentTestKw);
+      }
+
       screenState.todayPounds = random(0, 300);
       screenState.todayPence = random(0, 99);
       screenState.monthPounds = random(400, 1000);
@@ -707,6 +575,13 @@ void loop() {
       lcdPendingUpdate = true;
     }
     turnOnBacklight();
+  }
+
+  if (btn2Pressed) {
+    btn2Pressed = false;
+    Serial.printf("Button 2 Pressed\n");
+    turnOnBacklight();
+    screenState.buttonCount++;
   }
 
   if (millis() >= nextCheckWifiStatusAt) {
@@ -737,6 +612,31 @@ void loop() {
   }
 }
 
+void testLoop() {
+  if (!TEST_MODE) {
+    return;
+  }
+  unsigned long currentMillis = millis();
+  unsigned long diff = currentMillis - prevMillis;
+  int currentPeriodMs = (3600 * 1000) / currentTestKw;
+  if (diff >= nextInterval) {
+    if (ledState == STATE_LED_ON) {
+      digitalWrite(PIN_LED, LOW);
+      digitalWrite(PIN_PULSE, LOW);
+      nextInterval = currentPeriodMs - PULSE_INTERVAL_MS;  // Pulse at 1Kw for testing
+      ledState = STATE_LED_OFF;
+      Serial.printf("LED off for %d; Test KW=%d; Test Rate Period=%dms\n", nextInterval + PULSE_INTERVAL_MS, currentTestKw, currentPeriodMs);
+    } else if (ledState == STATE_LED_OFF) {
+      digitalWrite(PIN_LED, HIGH);
+      digitalWrite(PIN_PULSE, HIGH);
+      nextInterval = PULSE_INTERVAL_MS;
+      ledState = STATE_LED_ON;
+      Serial.printf("LED on for %d\n", nextInterval + PULSE_INTERVAL_MS);
+    }
+    prevMillis = millis();
+  }
+
+}
 
 WifiStrength getWiFiStrength() {
   int rssi = WiFi.RSSI();
@@ -766,6 +666,7 @@ void ICACHE_RAM_ATTR d3Rising() {
 void ICACHE_RAM_ATTR d3Falling() {
   // Check duration pulse was high for
   // If too long, then mark as eratic
+  Serial.println("Falling!"); // TODO remove this from IRP
   const unsigned long highDuration = micros() - lastPulseMicros;
   if (highDuration <= MAX_DURATION_MICROS || lastPulseMicros == -1) {
     if (sensorState == SensorState::Ok) {
@@ -800,6 +701,11 @@ void ICACHE_RAM_ATTR ISR_D3_change() {
 void ICACHE_RAM_ATTR ISR_D6_high() {
   btn1Pressed = true;
 }
+
+void ICACHE_RAM_ATTR ISR_D5_high() {
+  btn2Pressed = true;
+}
+
 
 void lcdConnectingToWifi() {
   lcd.clear();
@@ -1016,7 +922,6 @@ void otaFailed(int err) {
 
 
 void performOta() {
-  LittleFS.end();
   if (strlen(refreshResult.updateUrl) <= 0) {
     Serial.println("Skipping OTA update as no updateUrl provided");
     return;
@@ -1037,117 +942,4 @@ void performOta() {
   }
 }
 
-bool cfg_write(const char* name, char* value) {
-  File file = LittleFS.open(name, "w+");
-  if (!file) {
-    currentScreen = Screen::Error;
-    screenState.error = Error::FileOpenWFail;
-    lcdPendingUpdate = true;
-    return false;
-  }
-  int numWritten = file.print(value);
-  Serial.printf("Wrote %d\n", numWritten);
 
-  if (numWritten != strlen(value)) {
-    currentScreen = Screen::Error;
-    screenState.error = Error::FileWriteFail;
-    lcdPendingUpdate = true;
-    return false;
-  }
-  file.close();
-  Serial.printf("Wrote %s to %s\n", value, name);
-  return true;
-}
-
-bool cfg_read(const char* name, char* value, int maxLen) {
-  File file = LittleFS.open(name, "r");
-  if (!file) {
-    currentScreen = Screen::Error;
-    screenState.error = Error::FileOpenRFail;
-    lcdPendingUpdate = true;
-    value[0] = '\0';
-    return false;
-  }
-  int i = 0;
-  for (; i < maxLen - 1; i++) {
-    if (!file.available()) {
-      break;
-    } else {
-      value[i] = file.read();
-    }
-  }
-  value[i] = '\0';
-  Serial.printf("Read %s from %s\n", value, name);
-  return true;
-}
-
-// To avoid having to do much parsing, each config is stored in a separate
-// file, named the same as its CFG_* name
-struct config_t loadConfig() {
-  struct config_t config;
-  cfg_read(CFG_SECRET, config.secret, CFG_SIZE_SECRET);
-  cfg_read(CFG_SENSOR_ID, config.sensorId, CFG_SIZE_SENSOR_ID);
-  cfg_read(CFG_ENDPOINT, config.endpoint, CFG_SIZE_ENDPOINT);
-  cfg_read(CFG_SYNC_ROUTE, config.syncRoute, CFG_SIZE_SYNC_ROUTE);
-  cfg_read(CFG_REFRESH_ROUTE, config.refreshRoute, CFG_SIZE_REFRESH_ROUTE);
-  cfg_read(CFG_REFRESH_PERIOD, config.refreshPeriodSeconds, CFG_SIZE_REFRESH_PERIOD);
-  cfg_read(CFG_IMPL_PER_KWH, config.implusePerKwh, CFG_SIZE_IMPLUSE_KWH);
-
-  char* tmp;
-  refreshPeriodSeconds = strtol(config.refreshPeriodSeconds, &tmp, 10);
-  implusePerKwh = strtol(config.implusePerKwh, &tmp, 10);
-  return config;
-}
-
-void writeConfig(struct config_t config) {
-  Serial.printf("Writing %d %d\n", refreshPeriodSeconds, implusePerKwh);
-  Error validateError = Error::InvalidConfig;
-  if (!validateConfig(config, &validateError)) {
-    currentScreen = Screen::Error;
-    screenState.error = validateError;
-    lcdPendingUpdate = true;
-  }
-  cfg_write(CFG_SECRET, config.secret);
-  cfg_write(CFG_SENSOR_ID, config.sensorId);
-  cfg_write(CFG_ENDPOINT, config.endpoint);
-  cfg_write(CFG_SYNC_ROUTE, config.syncRoute);
-  cfg_write(CFG_REFRESH_ROUTE, config.refreshRoute);
-  cfg_write(CFG_REFRESH_PERIOD, config.refreshPeriodSeconds);
-  cfg_write(CFG_IMPL_PER_KWH, config.implusePerKwh);
-  char* tmp;
-  refreshPeriodSeconds = strtol(config.refreshPeriodSeconds, &tmp, 10);
-  implusePerKwh = strtol(config.implusePerKwh, &tmp, 10);
-}
-
-bool validateConfig(struct config_t config, Error* error) {
-  if (strlen(config.secret) <= 0) {
-    *error = Error::InvalidConfigSecret;
-    return false;
-  }
-  if (strlen(config.sensorId) <= 0) {
-    *error = Error::InvalidConfigSensorId;
-    return false;
-  }
-  if (strlen(config.endpoint) <= 0) {
-    *error = Error::InvalidConfigEndpoint;
-    return false;
-  }
-  if (strlen(config.syncRoute) <= 0) {
-    *error = Error::InvalidConfigSyncRoute;
-    return false;
-  }
-  if (strlen(config.refreshRoute) <= 0) {
-    *error = Error::InvalidConfigRefreshRoute;
-    return false;
-  }
-  if (refreshPeriodSeconds > 3600) {
-    *error = Error::InvalidConfigRefreshPeriod;
-    return false;
-  }
-
-  if (implusePerKwh <= 0) {
-    *error = Error::InvalidConfigImplKwh;
-    return false;
-  }
-  return true;
-}
