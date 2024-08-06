@@ -10,6 +10,7 @@
 #include <Wire.h>
 #include "Circular.h"
 #include "StringUtil.h"
+#include <errno.h>
 
 // Refresh string from server
 #define REFRESH_SIZE 512
@@ -67,32 +68,8 @@ unsigned long otaNextUpdateMs = 0;
 const unsigned int WIFI_STATUS_UPDATE_PERIOD_MS = 5000;
 unsigned long nextCheckWifiStatusAt = 0;
 
-// Config keys
-const char* CFG_SECRET = "secret";
-const char* CFG_SENSOR_ID = "sensorId";
-const char* CFG_ENDPOINT = "endpoint";
-const char* CFG_SYNC_ROUTE = "syncRoute";
-const char* CFG_REFRESH_ROUTE = "refreshRoute";
-const char* CFG_REFRESH_PERIOD = "refreshPeriod";  // In seconds
-const char* CFG_IMPL_PER_KWH = "impulseKwh";
-
-const int CFG_SIZE_SECRET= 256;
-const int CFG_SIZE_SENSOR_ID = 16;
-const int CFG_SIZE_ENDPOINT = 32;
-const int CFG_SIZE_SYNC_ROUTE = 32;
-const int CFG_SIZE_REFRESH_ROUTE = 32;
-const int CFG_SIZE_REFRESH_PERIOD = 16;
-const int CFG_SIZE_IMPLUSE_KWH = 16;
-
-struct config_t {
-  char secret[CFG_SIZE_SECRET];
-  char sensorId[CFG_SIZE_SENSOR_ID];
-  char endpoint[CFG_SIZE_ENDPOINT];
-  char syncRoute[CFG_SIZE_SYNC_ROUTE];
-  char refreshRoute[CFG_SIZE_REFRESH_ROUTE];
-  char refreshPeriodSeconds[CFG_SIZE_REFRESH_PERIOD];
-  char implusePerKwh[CFG_SIZE_IMPLUSE_KWH];
-};
+char syncEndpoint[256];
+char refreshEndpoint[256];
 
 int refreshPeriodSeconds = 20;
 int implusePerKwh = 0;
@@ -112,23 +89,7 @@ enum class Error {
   FileOpenRFail,
   FileOpenWFail,
   FileWriteFail,
-
-  // Config validation errors for each field
-  InvalidConfig,
-  InvalidConfigSensorId,
-  InvalidConfigSecret,
-  InvalidConfigEndpoint,
-  InvalidConfigSyncRoute,
-  InvalidConfigRefreshRoute,
-  InvalidConfigImplKwh,
-  InvalidConfigRefreshPeriod
 };
-
-bool isConfigError(Error error) {
-  return error == Error::InvalidConfig || error == Error::InvalidConfigSensorId || error == Error::InvalidConfigSecret 
-      || error == Error::InvalidConfigEndpoint || error == Error::InvalidConfigSyncRoute || error == Error::InvalidConfigRefreshRoute
-      || error == Error::InvalidConfigImplKwh || error == Error::InvalidConfigRefreshPeriod;
-}
 
 // State for rendering to the display
 enum class Screen {
@@ -173,8 +134,8 @@ const unsigned int BACKLIGHT_TIMEOUT_MS = 30 * 1000;
 bool backlightIsOn = false;
 unsigned int turnBacklightOffAt;
 
+
 struct screen_state_t screenState;
-struct config_t config;
 
 // Always 3 digits (EXY)
 const char* errorCode(Error error) {
@@ -195,30 +156,6 @@ const char* errorCode(Error error) {
   }
   if (error == Error::FileWriteFail) {
     return "E25";
-  }
-  if (error == Error::InvalidConfig) {
-    return "E30";
-  }
-  if (error == Error::InvalidConfigSecret) {
-    return "E31";
-  }
-  if (error == Error::InvalidConfigSensorId) {
-    return "E32";
-  }
-  if (error == Error::InvalidConfigEndpoint) {
-    return "E34";
-  }
-  if (error == Error::InvalidConfigSyncRoute) {
-    return "E35";
-  }
-  if (error == Error::InvalidConfigRefreshRoute) {
-    return "E36";
-  }
-  if (error == Error::InvalidConfigRefreshPeriod) {
-    return "E37";
-  }
-  if (error == Error::InvalidConfigImplKwh) {
-    return "E38";
   }
 
   return "E??";
@@ -243,30 +180,6 @@ const char* errorMessage(Error error) {
   }
   if (error == Error::FileWriteFail) {
     return "File write";
-  }
-  if (error == Error::InvalidConfig) {
-    return "Invalid config";
-  }
-  if (error == Error::InvalidConfigSecret) {
-    return "Cfg: secret";
-  }
-  if (error == Error::InvalidConfigSensorId) {
-    return "Cfg: sensorId";
-  }
-  if (error == Error::InvalidConfigEndpoint) {
-    return "Cfg: endpoint";
-  }
-  if (error == Error::InvalidConfigSyncRoute) {
-    return "Cfg: syncRoute";
-  }
-  if (error == Error::InvalidConfigRefreshRoute) {
-    return "Cfg: refreshRou";
-  }
-  if (error == Error::InvalidConfigRefreshPeriod) {
-    return "Cfg: refreshPer";
-  }
-  if (error == Error::InvalidConfigImplKwh) {
-    return "Cfg: implKwh";
   }
   return "Unknown";
 }
@@ -441,10 +354,6 @@ void writeStateToUploadString() {
   }
 }
 
-bool shouldSaveConfig = false;
-void onWifiSaveConfig() {
-  shouldSaveConfig = true;
-}
 
 void onAutoConnectFailed(WiFiManager *_wm) {
   currentScreen = Screen::ConnectToAp;
@@ -453,14 +362,8 @@ void onAutoConnectFailed(WiFiManager *_wm) {
 }
 
 void startWifiPortal(bool autoConnect) {
+  Serial.println("startWifiPortal()");
   WiFiManager wifiManager;
-  WiFiManagerParameter param_secret(CFG_SECRET, CFG_SECRET, config.secret, CFG_SIZE_SECRET);
-  WiFiManagerParameter param_sensor_id(CFG_SENSOR_ID, CFG_SENSOR_ID, config.sensorId, CFG_SIZE_SENSOR_ID);
-  WiFiManagerParameter param_endpoint(CFG_ENDPOINT, CFG_ENDPOINT, config.endpoint, CFG_SIZE_ENDPOINT);
-  WiFiManagerParameter param_sync_route(CFG_SYNC_ROUTE, CFG_SYNC_ROUTE, config.syncRoute, CFG_SIZE_SYNC_ROUTE);
-  WiFiManagerParameter param_refresh_route(CFG_REFRESH_ROUTE, CFG_REFRESH_ROUTE, config.refreshRoute, CFG_SIZE_REFRESH_ROUTE);
-  WiFiManagerParameter param_refresh_period(CFG_REFRESH_PERIOD, CFG_REFRESH_PERIOD, config.refreshPeriodSeconds, CFG_SIZE_REFRESH_PERIOD);
-  WiFiManagerParameter param_impluse_kwh(CFG_IMPL_PER_KWH, CFG_IMPL_PER_KWH, config.implusePerKwh, CFG_SIZE_IMPLUSE_KWH);
 
   if (autoConnect) {
     wifiManager.getWiFiSSID(true).toCharArray(screenState.connectingSSID, 32);
@@ -472,18 +375,7 @@ void startWifiPortal(bool autoConnect) {
     } 
   }
 
-  shouldSaveConfig = false;
-  wifiManager.setSaveConfigCallback(onWifiSaveConfig);
-
-  wifiManager.addParameter(&param_secret);
-  wifiManager.addParameter(&param_sensor_id);
-  wifiManager.addParameter(&param_endpoint);
-  wifiManager.addParameter(&param_sync_route);
-  wifiManager.addParameter(&param_refresh_route);
-  wifiManager.addParameter(&param_refresh_period);
-  wifiManager.addParameter(&param_impluse_kwh);
   wifiManager.setConfigPortalTimeout(PORTAL_TIMEOUT_SEC);
-
   wifiManager.setAPCallback(onAutoConnectFailed);
   // If autoConnect set to true, then we only show portal if connection failed
   // Otherwise, always show the config so that the user can edit the config settings
@@ -493,24 +385,10 @@ void startWifiPortal(bool autoConnect) {
     wifiManager.startConfigPortal(AP_SSID);
   }
   Serial.println("Wifi Portal done!");
+}
 
-  if (shouldSaveConfig) {
-    strlcpy(config.secret, param_secret.getValue(), CFG_SIZE_SECRET);
-    strlcpy(config.sensorId, param_sensor_id.getValue(),CFG_SIZE_SENSOR_ID);
-    strlcpy(config.endpoint, param_endpoint.getValue(), CFG_SIZE_ENDPOINT);
-    strlcpy(config.syncRoute, param_sync_route.getValue(), CFG_SIZE_SYNC_ROUTE);
-    strlcpy(config.refreshRoute, param_refresh_route.getValue(), CFG_SIZE_REFRESH_ROUTE);
-    strlcpy(config.refreshPeriodSeconds, param_refresh_period.getValue(), CFG_SIZE_REFRESH_PERIOD);
-    strlcpy(config.implusePerKwh, param_impluse_kwh.getValue(), CFG_SIZE_IMPLUSE_KWH);
-    Serial.printf("Writing config to flash\n");
-    writeConfig(config);
-  }
-
-  Error validateError = Error::InvalidConfig;
-  if (validateConfig(config, &validateError)) {
-    currentScreen = Screen::Hello;
-  }
-
+void p(int a) {
+  Serial.printf("%d\n", a);
 }
 
 void setup() {
@@ -542,16 +420,7 @@ void setup() {
   pinMode(PIN_BTN_1, INPUT);
   currentScreen = Screen::Hello;
 
-  config = loadConfig();
-  Error validateError;
-  if (!validateConfig(config, &validateError)) {
-    Serial.println("Invalid config");
-    currentScreen = Screen::Error;
-    screenState.error = validateError;
-    lcdPendingUpdate = true;
-  } else {
-    startWifiPortal(true);
-  }
+  startWifiPortal(true);
 
   lcdPendingUpdate = true;
 
@@ -692,13 +561,6 @@ void loop() {
       } else if (currentScreen == Screen::CurrentAndMonth) {
         currentScreen = Screen::Hello;
       } else if (currentScreen == Screen::Error) {
-        // TODO Need to determine what to do with each error 
-        if (isConfigError(screenState.error)) {
-          currentScreen = Screen::ConnectToAp;
-          lcdPendingUpdate = true;
-          lcdRenderLoop();
-          startWifiPortal(false);
-        }
       }
       screenState.todayPounds = random(0, 300);
       screenState.todayPence = random(0, 99);
@@ -1037,117 +899,4 @@ void performOta() {
   }
 }
 
-bool cfg_write(const char* name, char* value) {
-  File file = LittleFS.open(name, "w+");
-  if (!file) {
-    currentScreen = Screen::Error;
-    screenState.error = Error::FileOpenWFail;
-    lcdPendingUpdate = true;
-    return false;
-  }
-  int numWritten = file.print(value);
-  Serial.printf("Wrote %d\n", numWritten);
 
-  if (numWritten != strlen(value)) {
-    currentScreen = Screen::Error;
-    screenState.error = Error::FileWriteFail;
-    lcdPendingUpdate = true;
-    return false;
-  }
-  file.close();
-  Serial.printf("Wrote %s to %s\n", value, name);
-  return true;
-}
-
-bool cfg_read(const char* name, char* value, int maxLen) {
-  File file = LittleFS.open(name, "r");
-  if (!file) {
-    currentScreen = Screen::Error;
-    screenState.error = Error::FileOpenRFail;
-    lcdPendingUpdate = true;
-    value[0] = '\0';
-    return false;
-  }
-  int i = 0;
-  for (; i < maxLen - 1; i++) {
-    if (!file.available()) {
-      break;
-    } else {
-      value[i] = file.read();
-    }
-  }
-  value[i] = '\0';
-  Serial.printf("Read %s from %s\n", value, name);
-  return true;
-}
-
-// To avoid having to do much parsing, each config is stored in a separate
-// file, named the same as its CFG_* name
-struct config_t loadConfig() {
-  struct config_t config;
-  cfg_read(CFG_SECRET, config.secret, CFG_SIZE_SECRET);
-  cfg_read(CFG_SENSOR_ID, config.sensorId, CFG_SIZE_SENSOR_ID);
-  cfg_read(CFG_ENDPOINT, config.endpoint, CFG_SIZE_ENDPOINT);
-  cfg_read(CFG_SYNC_ROUTE, config.syncRoute, CFG_SIZE_SYNC_ROUTE);
-  cfg_read(CFG_REFRESH_ROUTE, config.refreshRoute, CFG_SIZE_REFRESH_ROUTE);
-  cfg_read(CFG_REFRESH_PERIOD, config.refreshPeriodSeconds, CFG_SIZE_REFRESH_PERIOD);
-  cfg_read(CFG_IMPL_PER_KWH, config.implusePerKwh, CFG_SIZE_IMPLUSE_KWH);
-
-  char* tmp;
-  refreshPeriodSeconds = strtol(config.refreshPeriodSeconds, &tmp, 10);
-  implusePerKwh = strtol(config.implusePerKwh, &tmp, 10);
-  return config;
-}
-
-void writeConfig(struct config_t config) {
-  Serial.printf("Writing %d %d\n", refreshPeriodSeconds, implusePerKwh);
-  Error validateError = Error::InvalidConfig;
-  if (!validateConfig(config, &validateError)) {
-    currentScreen = Screen::Error;
-    screenState.error = validateError;
-    lcdPendingUpdate = true;
-  }
-  cfg_write(CFG_SECRET, config.secret);
-  cfg_write(CFG_SENSOR_ID, config.sensorId);
-  cfg_write(CFG_ENDPOINT, config.endpoint);
-  cfg_write(CFG_SYNC_ROUTE, config.syncRoute);
-  cfg_write(CFG_REFRESH_ROUTE, config.refreshRoute);
-  cfg_write(CFG_REFRESH_PERIOD, config.refreshPeriodSeconds);
-  cfg_write(CFG_IMPL_PER_KWH, config.implusePerKwh);
-  char* tmp;
-  refreshPeriodSeconds = strtol(config.refreshPeriodSeconds, &tmp, 10);
-  implusePerKwh = strtol(config.implusePerKwh, &tmp, 10);
-}
-
-bool validateConfig(struct config_t config, Error* error) {
-  if (strlen(config.secret) <= 0) {
-    *error = Error::InvalidConfigSecret;
-    return false;
-  }
-  if (strlen(config.sensorId) <= 0) {
-    *error = Error::InvalidConfigSensorId;
-    return false;
-  }
-  if (strlen(config.endpoint) <= 0) {
-    *error = Error::InvalidConfigEndpoint;
-    return false;
-  }
-  if (strlen(config.syncRoute) <= 0) {
-    *error = Error::InvalidConfigSyncRoute;
-    return false;
-  }
-  if (strlen(config.refreshRoute) <= 0) {
-    *error = Error::InvalidConfigRefreshRoute;
-    return false;
-  }
-  if (refreshPeriodSeconds > 3600) {
-    *error = Error::InvalidConfigRefreshPeriod;
-    return false;
-  }
-
-  if (implusePerKwh <= 0) {
-    *error = Error::InvalidConfigImplKwh;
-    return false;
-  }
-  return true;
-}

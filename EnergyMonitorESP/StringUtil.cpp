@@ -37,7 +37,7 @@ void centerString(char* outputString, int width, char* stringToCenter) {
 }
 
 
-int startsWith(char* prefix, char* str) {
+int startsWith(const char* prefix, char* str) {
     return strncmp(prefix, str, strlen(prefix)) == 0;
 }
 

@@ -4,7 +4,7 @@
 #define CAPACITY 100
 
 struct circular_buffer {
-    volatile unsigned int buffer[CAPACITY];
+    volatile unsigned int buffer[CAPACITY] = {0};
     volatile unsigned int writeIndex;
     volatile unsigned int size;
 };
