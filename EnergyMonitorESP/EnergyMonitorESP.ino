@@ -55,21 +55,29 @@ unsigned long prevMillis = 0;
 unsigned long nextInterval = 1000;
 
 // State for upload syncs
-unsigned long lastUploadMs = 0;
+// We do an upload if 
+//  1. a button has been pressed: then upload every 10 seconds 
+//  2. otherwise upload every hour
+//  3. unless we get to 80% of circular buffer size, then upload now
+
+unsigned long ACTIVE_UPLOAD_INTERVAL = 10 * 1000; 
+unsigned long INACTIVE_UPLOAD_INTERVAL = 60 * 60 * 1000;  // 1 hour
+
 char uploadStr[UPLOAD_BUFFER_SIZE] = "";
-unsigned long nextUploadMs = 1000 * SYNC_PERIOD_SECONDS;
+unsigned long lastUploadMs = 0;
+unsigned long uploadAfter = 10 * 1000;
 unsigned int failureCount = 0;
 
-const unsigned int REFRESH_AFTER_SYNC_PERIOD_MS = 2000;
-unsigned long nextRefresh = 1000000;
 
 // Update LCD this frequently with percent progress
 const unsigned long OTA_LCD_REFRESH_PERIOD_MS = 1000;
 unsigned long otaNextUpdateMs = 0;
 
 // Update wifi stength info
-const unsigned int WIFI_STATUS_UPDATE_PERIOD_MS = 5000;
-unsigned long nextCheckWifiStatusAt = 0;
+unsigned long updateWifiAfter = 5000;
+unsigned long wifiCheckedAt = 0;
+
+bool doRefresh = false;
 
 char syncEndpoint[256];
 char refreshEndpoint[256];
@@ -135,7 +143,7 @@ struct screen_state_t {
 // Backlight - turn off when inactive
 const unsigned int BACKLIGHT_TIMEOUT_MS = 30 * 1000;
 bool backlightIsOn = false;
-unsigned int turnBacklightOffAt;
+unsigned long backlightOnAt = 0;
 
 struct screen_state_t screenState;
 
@@ -304,9 +312,10 @@ LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
 void turnOnBacklight() {
   if (!backlightIsOn) {
     lcd.backlight();
+    updateWifiAfter = 5 * 1000;
     backlightIsOn = true;
   }
-  turnBacklightOffAt = millis() + BACKLIGHT_TIMEOUT_MS;
+  backlightOnAt = millis();
 }
 
 void append(int* idx, const char* toAppend) {
@@ -436,7 +445,6 @@ void setup() {
   randomSeed(analogRead(0));
   interval_buffer = circular_init();
   turnOnBacklight();  // Now setup complete, set backlight on timer
-  nextUploadMs = 1000 * SYNC_PERIOD_SECONDS;
 
   Serial.println("Syncing time");
   timeClient.begin();
@@ -512,28 +520,51 @@ int calculateCurrentPowerWatts(int periodMs) {
   return 1000 * (3600 / periodSeconds) / IMPL_PER_KWH;
 }
 
+bool shouldUpload() {
+  unsigned long timeSinceUpload = millis() - lastUploadMs;
+  if (backlightIsOn) {
+    if (timeSinceUpload > ACTIVE_UPLOAD_INTERVAL) {
+      Serial.println("Upload reason: active upload");
+      return true;
+    } else {
+      return false;
+    }
+  } else {
+    if (interval_buffer.size > 0.8 * CAPACITY) {
+      Serial.println("Upload reason: >80% buffer filled");
+      return true;
+    }
+    if (timeSinceUpload > INACTIVE_UPLOAD_INTERVAL) {
+      Serial.println("Upload reason: inactive upload");
+      return true;
+    } else {
+      return false;
+    }
+  }
+}
+
+
 void loop() {
   timeClient.update(); // time updates every hour
   lcdRenderLoop();
   testLoop();
   unsigned long now = millis();
-  // TODO upload on buffer nearing capacity
-  if (now >= nextUploadMs) {
+  if (shouldUpload()) {
+    lastUploadMs = now;
     if (uploadSamples()) {
-      nextUploadMs = now + 1000 * SYNC_PERIOD_SECONDS;
+      uploadAfter = 1000 * SYNC_PERIOD_SECONDS;
       failureCount = 0;
     } else {
       // On failure, retry sooner - just do multiplicative backoff capped at 5s
       failureCount += 1;
       const int backoffCount = failureCount > 10 ? failureCount : failureCount;
-      nextUploadMs = millis() + (backoffCount * 500);
+      uploadAfter = (backoffCount * 500);
     }
-    nextRefresh = (unsigned long)millis() + REFRESH_AFTER_SYNC_PERIOD_MS;
   }
 
-  if (now >= nextRefresh && !TEST_MODE) {
+  if (doRefresh && !TEST_MODE) {
+    doRefresh = false;
     Serial.println("Refreshing");
-    nextRefresh = (unsigned long)millis() + 100000000;
     if (refresh()) {
       Serial.printf("Refresh OK! updateUrl=%s\n", refreshResult.updateUrl);
     } else {
@@ -545,7 +576,6 @@ void loop() {
   if (btn1Pressed) {
     btn1Pressed = false;
     Serial.printf("Button 1 Pressed\n");
-    screenState.buttonCount++;
     lcdPendingUpdate = true;
     // Only move screen if backlgiht is on - o/w first press should only turn backlight on
     if (backlightIsOn) {
@@ -573,18 +603,19 @@ void loop() {
       screenState.monthPounds = random(400, 1000);
       screenState.monthPence = random(0, 20);
       lcdPendingUpdate = true;
-    }
+    } 
     turnOnBacklight();
   }
 
   if (btn2Pressed) {
     btn2Pressed = false;
+    doRefresh = true;
     Serial.printf("Button 2 Pressed\n");
     turnOnBacklight();
-    screenState.buttonCount++;
   }
 
-  if (millis() >= nextCheckWifiStatusAt) {
+  if (millis() - wifiCheckedAt > updateWifiAfter) {
+    wifiCheckedAt = millis();
     // Update Wifi signal strength that is shown on LCD
     const WifiStrength newStrength = getWiFiStrength();
     // Check if difference to prevent unneeded lcd updates
@@ -592,12 +623,12 @@ void loop() {
       screenState.wifiStrength = newStrength;
       lcdPendingUpdate = true;
     }
-    nextCheckWifiStatusAt = millis() + WIFI_STATUS_UPDATE_PERIOD_MS;
   }
 
-  if (backlightIsOn && millis() > turnBacklightOffAt) {
+  if (backlightIsOn && millis() - backlightOnAt > BACKLIGHT_TIMEOUT_MS) {
     backlightIsOn = false;
     lcd.noBacklight();
+    updateWifiAfter = 60 * 1000;
   }
 
   if (currentUpdated) {
@@ -666,7 +697,6 @@ void ICACHE_RAM_ATTR d3Rising() {
 void ICACHE_RAM_ATTR d3Falling() {
   // Check duration pulse was high for
   // If too long, then mark as eratic
-  Serial.println("Falling!"); // TODO remove this from IRP
   const unsigned long highDuration = micros() - lastPulseMicros;
   if (highDuration <= MAX_DURATION_MICROS || lastPulseMicros == -1) {
     if (sensorState == SensorState::Ok) {

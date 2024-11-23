@@ -1,7 +1,9 @@
 #ifndef CIRCULAR_H 
 #define CIRCULAR_H
 
-#define CAPACITY 100
+// TODO refine below
+// this is how large the capacity is
+#define CAPACITY 50
 
 struct circular_buffer {
     volatile unsigned int buffer[CAPACITY] = {0};
