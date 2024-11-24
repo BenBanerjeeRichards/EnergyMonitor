@@ -12,18 +12,17 @@ struct circular_buffer circular_init() {
     return buf;
 }
 
-struct circular_buffer circular_add(struct circular_buffer buf, unsigned int item) {
-    buf.buffer[buf.writeIndex] = item;
-    buf.writeIndex = mod((buf.writeIndex + 1), CAPACITY);
+void circular_add(struct circular_buffer* buf, unsigned int item) {
+    buf->buffer[buf->writeIndex] = item;
+    buf->writeIndex = mod((buf->writeIndex + 1), CAPACITY);
 
-    if (buf.size < CAPACITY) {
-        buf.size++;
+    if (buf->size < CAPACITY) {
+        buf->size++;
     }
-    return buf;
 }
 
 // Get items where index 0 is latest item added to buffer and CAPACITY-1 is the last item
-unsigned int circular_get(struct circular_buffer buf, int idx) {
-    return buf.buffer[mod((buf.writeIndex - (idx + 1)),CAPACITY)];
+unsigned int circular_get(struct circular_buffer* buf, int idx) {
+    return buf->buffer[mod((buf->writeIndex - (idx + 1)),CAPACITY)];
 }
 

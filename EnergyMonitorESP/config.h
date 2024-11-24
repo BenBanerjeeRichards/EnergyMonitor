@@ -8,6 +8,13 @@
 #define PORTAL_TIMEOUT_SEC 600
 // Test mode - this just flashes the LED on pin 14 to check a second device
 #define TEST_MODE false
+// Send requests to local endpoints (defined below) instead of cloud run
+#define LOCAL_SERVER true
+
+#if (LOCAL_SERVER == true)
+#undef SYNC_ENDPOINT
+#undef REFRESH_ENDPOINT
+#endif 
 
 #ifndef SYNC_ENDPOINT
 #define SYNC_ENDPOINT "http://192.168.1.84:8090/v1/sync"

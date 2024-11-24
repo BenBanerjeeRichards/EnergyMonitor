@@ -195,7 +195,12 @@ const char* errorMessage(Error error) {
   return "Unknown";
 }
 
+#if (LOCAL_SERVER == true)
+WiFiClient client;
+#else 
 WiFiClientSecure client;
+#endif
+
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 3600000L);
 
@@ -342,7 +347,7 @@ void writeStateToUploadString(unsigned long currentUnix) {
   writeKeyValue(&writeIndex, "size", numberStr);
   append(&writeIndex, "values=");
   for (int i = 0; i < interval_buffer.size; i++) {
-    sprintf(numberStr, "%d", circular_get(interval_buffer, i));
+    sprintf(numberStr, "%d", circular_get(&interval_buffer, i));
     append(&writeIndex, numberStr);
     append(&writeIndex, ",");
 
@@ -430,8 +435,9 @@ void setup() {
   randomSeed(analogRead(0));
   interval_buffer = circular_init();
   turnOnBacklight();  // Now setup complete, set backlight on timer
+#if (LOCAL_SERVER == fasle)
   client.setInsecure(); // Don't bother with certs, this isn't really that sensitive
-
+#endif
   Serial.println("Syncing time");
   timeClient.begin();
   timeClient.update();
@@ -687,7 +693,7 @@ void ICACHE_RAM_ATTR d3Falling() {
   const unsigned long highDuration = micros() - lastPulseMicros;
   if (highDuration <= MAX_DURATION_MICROS || lastPulseMicros == -1) {
     if (sensorState == SensorState::Ok) {
-      interval_buffer = circular_add(interval_buffer, lastPulseDurationMicros);
+      circular_add(&interval_buffer, lastPulseDurationMicros);
       lastDurationUs = lastPulseDurationMicros;
       currentUpdated = true;
     } else if (sensorState == SensorState::Disconnected) {
