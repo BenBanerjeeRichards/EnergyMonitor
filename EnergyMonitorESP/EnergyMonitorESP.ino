@@ -3,6 +3,7 @@
 #include <ESP8266httpUpdate.h>
 #include "Fs.h"
 #include <WiFiManager.h>
+#include "secrets.h"
 #include "config.h"
 #include "FS.h"
 #include <LiquidCrystal_I2C.h>
@@ -108,7 +109,6 @@ enum class Screen {
   ConnectToAp,       // Instruct user to connect to the AP for setup
   ConnectingToWifi,  // Connecting to a specific (already saved) AP
   CurrentAndDay,     // Show current usage in W and the total used this day
-  CurrentAndMonth,   // Same as above, but show the billing period (month)
   Error,             // Display an error code
   Updating,          // OTA update progress
   UpdateOk           // Shown on LCD before restart
@@ -125,13 +125,9 @@ struct screen_state_t {
 
   // CurrentAndDay
   int currentWatts;
-  int todayPounds;
-  int todayPence;
   WifiStrength wifiStrength;
-
-  // Month
-  int monthPounds;
-  int monthPence;
+  int bufferSize;
+  int minutesSinceLastUpdate;
 
   // Error
   Error error;
@@ -199,7 +195,7 @@ const char* errorMessage(Error error) {
   return "Unknown";
 }
 
-WiFiClient client;
+WiFiClientSecure client;
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 3600000L);
 
@@ -225,16 +221,6 @@ void clearError() {
   lcdPendingUpdate = true;
 }
 
-byte poundLcdChar[8] = {
-  0b01111,
-  0b01000,
-  0b01000,
-  0b11110,
-  0b01000,
-  0b01000,
-  0b11111,
-  0b00000
-};
 
 byte wifiStrenghVeryGoodChar[8]{
   0b00000,
@@ -417,7 +403,6 @@ void setup() {
   lcd.init();
   lcd.clear();
   lcd.backlight();  // Keep on for setup
-  lcd.createChar(LCD_CUSTOM_POUND, poundLcdChar);
   lcd.createChar(LCD_CUSTOM_WIFI_VERY_STRONG, wifiStrenghVeryGoodChar);
   lcd.createChar(LCD_CUSTOM_WIFI_GOOD, wifiStrenghGoodChar);
   lcd.createChar(LCD_CUSTOM_WIFI_OK, wifiStrenghOkChar);
@@ -445,6 +430,7 @@ void setup() {
   randomSeed(analogRead(0));
   interval_buffer = circular_init();
   turnOnBacklight();  // Now setup complete, set backlight on timer
+  client.setInsecure(); // Don't bother with certs, this isn't really that sensitive
 
   Serial.println("Syncing time");
   timeClient.begin();
@@ -464,6 +450,8 @@ bool uploadSamples() {
   Serial.printf("Uploading samples %d to %s\n", interval_buffer.size, SYNC_ENDPOINT);
 
   HTTPClient http;
+  http.setTimeout(8 * 1000);  // Can be long in case of cold start
+
   http.begin(client, SYNC_ENDPOINT);
   int resp = http.PUT(uploadStr);
   Serial.printf("Upload HTTP response code %d\n", resp);
@@ -579,10 +567,10 @@ void loop() {
     lcdPendingUpdate = true;
     // Only move screen if backlgiht is on - o/w first press should only turn backlight on
     if (backlightIsOn) {
-      if (currentScreen == Screen::Hello || currentScreen == Screen::CurrentAndMonth) {
+      if (currentScreen == Screen::Hello) {
         currentScreen = Screen::CurrentAndDay;
       } else if (currentScreen == Screen::CurrentAndDay) {
-        currentScreen = Screen::CurrentAndMonth;
+        currentScreen = Screen::Hello;
       } else if (currentScreen == Screen::Error) {
         // TODO 
       }
@@ -598,10 +586,6 @@ void loop() {
         Serial.printf("New Test KW: %d\n", currentTestKw);
       }
 
-      screenState.todayPounds = random(0, 300);
-      screenState.todayPence = random(0, 99);
-      screenState.monthPounds = random(400, 1000);
-      screenState.monthPence = random(0, 20);
       lcdPendingUpdate = true;
     } 
     turnOnBacklight();
@@ -640,6 +624,9 @@ void loop() {
         lcdPendingUpdate = true;
       }
     }
+    // Show the updated count since last upload on the screen
+    screenState.bufferSize = interval_buffer.size;
+    lcdPendingUpdate = true;
   }
 }
 
@@ -784,7 +771,7 @@ int specialCharForWifiStrength(WifiStrength strength) {
   return 1;
 }
 
-void lcdCurrentUsage(WifiStrength strength, const char* periodString, int watts, int todayPounds, int todayPence) {
+void lcdCurrentUsage(WifiStrength strength, int watts, int bufferSize, int minutesSinceLastUpdate) {
   char topLine[16];
   char finalTopLine[17];
   int position = 0;
@@ -800,17 +787,11 @@ void lcdCurrentUsage(WifiStrength strength, const char* periodString, int watts,
 
   char bottomLine[17];
   char finalBottomLine[17];
-  strcpy(bottomLine, periodString);
-  position = strlen(periodString);
-  strcpy(bottomLine + position, " \243");
-  position += 2;
-  intToString(bottomLine, 16, &position, todayPounds, "---", 4);
-  const char* sepStr = todayPence < 10 ? ".0" : ".";
-  strcpy(bottomLine + position, sepStr);
-  position += strlen(sepStr);
-  intToString(bottomLine, 16, &position, todayPence, "--", 2);
-  centerString(finalBottomLine, 16, bottomLine);
-  lcdWriteWithSpecials(finalBottomLine, 0, 1);
+
+  // On the bottom line, show circular buffer size and the time since last sync 
+  // TODO 
+  lcd.setCursor(0, 1);
+  lcd.print(finalBottomLine);
 }
 
 void lcdConnectToAP() {
@@ -861,13 +842,9 @@ void lcdWriteWithSpecials(char* string, int startCol, int row) {
   char tmp[2];
   for (int col = startCol; col < strlen(string) + startCol; col++) {
     lcd.setCursor(col, row);
-    if (string[col] == '\243') {
-      lcd.write(LCD_CUSTOM_POUND);
-    } else {
-      strncpy(tmp, string + col, 1);
-      tmp[1] = '\0';
-      lcd.print(tmp);
-    }
+    strncpy(tmp, string + col, 1);
+    tmp[1] = '\0';
+    lcd.print(tmp);
   }
 }
 
@@ -892,10 +869,7 @@ void lcdRenderLoop() {
       lcdHello();
       break;
     case Screen::CurrentAndDay:
-      lcdCurrentUsage(screenState.wifiStrength, "Day", screenState.currentWatts, screenState.todayPounds, screenState.todayPence);
-      break;
-    case Screen::CurrentAndMonth:
-      lcdCurrentUsage(screenState.wifiStrength, "Month", screenState.currentWatts, screenState.monthPounds, screenState.monthPence);
+      lcdCurrentUsage(screenState.wifiStrength, screenState.currentWatts, screenState.bufferSize, screenState.minutesSinceLastUpdate);
       break;
     case Screen::ConnectingToWifi:
       lcdConnectingToWifi(screenState.connectingSSID);
