@@ -29,6 +29,8 @@ const int PIN_BTN_2 = 14;
 // State for tracking pulses
 volatile unsigned long lastPulseMicros = -1;
 volatile unsigned long lastPulseDurationMicros = -1;
+unsigned long lastPulseUnix = 0;
+
 // Erratic measurement tracking
 // More than 200ms at high indicates erratic measurements - e.g. sensor not attached to meter
 // If this occurs, wait for a number of normal measurements until we resume operations
@@ -37,7 +39,9 @@ enum class SensorState { Ok,
                          Erratic,
                          Disconnected };
 
-const unsigned long MAX_DURATION_MICROS = 200 * 1000;
+const unsigned long MAX_DURATION_MICROS = 100 * 1000;
+const unsigned long MIN_DURATION_MICROS = 10 * 1000;  // Pulse length is often around 50ms
+const unsigned long MIN_PERIOD_MICROS = 30 * 1000;    // 40us would be 25kW @ 1000 impl/sec. 25kW = 250V * 100A
 const unsigned int RETURN_TO_NORMALITY_TRESH = 3;     // Wait for this number of normal measurements until OK
 bool hasBeenErratic = false;                          // Have we been erratic in this sync period? Set so we can notify API
 int normalityCount = 0;                               // When in erratic mode, how many consequative OK measurements have we had
@@ -58,16 +62,15 @@ unsigned long nextInterval = 1000;
 // State for upload syncs
 // We do an upload if 
 //  1. a button has been pressed: then upload every 10 seconds 
-//  2. otherwise upload every hour
+//  2. otherwise upload every 5 minutes
 //  3. unless we get to 80% of circular buffer size, then upload now
-
-unsigned long ACTIVE_UPLOAD_INTERVAL = 10 * 1000; 
-unsigned long INACTIVE_UPLOAD_INTERVAL = 60 * 60 * 1000;  // 1 hour
+unsigned long ACTIVE_UPLOAD_INTERVAL = 11 * 1000; 
+unsigned long INACTIVE_UPLOAD_INTERVAL = 5 * 60 * 1000;  // 5 minutes
 
 char uploadStr[UPLOAD_BUFFER_SIZE] = "";
 unsigned long lastUploadMs = 0;
-unsigned long uploadAfter = 10 * 1000;
-unsigned int failureCount = 0;
+unsigned long lastFailureMs = 0;
+int failureCount = 0;
 
 
 // Update LCD this frequently with percent progress
@@ -86,6 +89,8 @@ char refreshEndpoint[256];
 int refreshPeriodSeconds = 20;
 int implusePerKwh = 0;
 
+bool firstUpload = true;
+
 enum class WifiStrength {
   VeryGood,
   Good,
@@ -95,12 +100,12 @@ enum class WifiStrength {
 };
 
 enum class Error {
+  None,
   ErraticSensor,
   UploadMem,
   UpdateFailed,
-  FileOpenRFail,
-  FileOpenWFail,
-  FileWriteFail,
+  SyncFailed,
+  RefreshFailed
 };
 
 // State for rendering to the display
@@ -130,7 +135,7 @@ struct screen_state_t {
   int minutesSinceLastUpdate;
 
   // Error
-  Error error;
+  Error error = Error::None;
 
   // Updating
   int updatePercent;
@@ -159,17 +164,19 @@ const char* errorCode(Error error) {
   if (error == Error::UpdateFailed) {
     return "E22";
   }
-  if (error == Error::FileOpenRFail) {
+  if (error == Error::SyncFailed) {
     return "E23";
   }
-  if (error == Error::FileOpenWFail) {
+  if (error == Error::RefreshFailed) {
     return "E24";
   }
-  if (error == Error::FileWriteFail) {
-    return "E25";
-  }
-
   return "E??";
+}
+
+bool canClearError(Error error) {
+  // Erratic sensor is ongoing until sensor condtion returns to normal
+  if (error == Error::ErraticSensor) return false;
+  return true;
 }
 
 // Always less than 16 chars
@@ -183,14 +190,11 @@ const char* errorMessage(Error error) {
   if (error == Error::UpdateFailed) {
     return "Update failed";
   }
-  if (error == Error::FileOpenRFail) {
-    return "File open read";
+  if (error == Error::SyncFailed) {
+    return "Sync failed";
   }
-  if (error == Error::FileOpenWFail) {
-    return "File open write";
-  }
-  if (error == Error::FileWriteFail) {
-    return "File write";
+  if (error == Error::RefreshFailed) {
+    return "Refresh failed";
   }
   return "Unknown";
 }
@@ -205,27 +209,22 @@ WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 3600000L);
 
 Error error;
-boolean activeError = false;
-Screen screenRestoreToAfterError;
 
 bool cfg_write(const char* name, char* value);
 bool cfg_read(const char* name, char* value, int maxLength);
 
-void setError(Error error) {
-  error = error;
-  screenRestoreToAfterError = currentScreen;
+void setError(Error newError) {
+  error = newError;
   screenState.error = error;
   currentScreen = Screen::Error;
-  activeError = false;
   lcdPendingUpdate = true;
 }
 
 void clearError() {
-  activeError = false;
-  currentScreen = screenRestoreToAfterError;
+  currentScreen = Screen::CurrentAndDay;
+  error = Error::None;
   lcdPendingUpdate = true;
 }
-
 
 byte wifiStrenghVeryGoodChar[8]{
   0b00000,
@@ -284,7 +283,7 @@ void ICACHE_RAM_ATTR ISR_D5_high();
 
 struct circular_buffer interval_buffer;
 unsigned long lastDurationUs = 0;
-bool currentUpdated = false;
+bool newPulseOccured = false;
 
 struct refresh_result_t {
   // If this is set, then we are sending an update
@@ -321,15 +320,17 @@ void writeKeyValue(int* idx, const char* key, const char* val) {
   append(idx, ";");
 }
 
-void writeStateToUploadString(unsigned long currentUnix) {
+void writeStateToUploadString() {
   char numberStr[15];  // Buffer for conversion from int -> string
   int writeIndex = 0;  // Current location in global uploadStr we are at
   writeKeyValue(&writeIndex, "version", VERSION);
   writeKeyValue(&writeIndex, "sensorId", SENSOR_ID);
+  // So we can track when the device restarts
+  writeKeyValue(&writeIndex, "firstUpload", firstUpload ? "true" : "false");
 
   sprintf(numberStr, "%d", WiFi.RSSI());
   writeKeyValue(&writeIndex, "rssi", numberStr);
-  sprintf(numberStr, "%lu", currentUnix);
+  sprintf(numberStr, "%lu", lastPulseUnix);
   writeKeyValue(&writeIndex, "timestamp", numberStr);
 
   const char* sensorStateStr = "ok";
@@ -448,15 +449,14 @@ void setup() {
 
 bool uploadSamples() {
   if (TEST_MODE) return true;
-  unsigned long currentUnix = timeClient.getEpochTime();
   noInterrupts();
   unsigned int numToUpload = interval_buffer.size;
-  writeStateToUploadString(currentUnix);
+  writeStateToUploadString();
   interrupts();
   Serial.printf("Uploading samples %d to %s\n", interval_buffer.size, SYNC_ENDPOINT);
 
   HTTPClient http;
-  http.setTimeout(8 * 1000);  // Can be long in case of cold start
+  http.setTimeout(15 * 1000); 
 
   http.begin(client, SYNC_ENDPOINT);
   int resp = http.PUT(uploadStr);
@@ -464,6 +464,7 @@ bool uploadSamples() {
   http.end();
   int success = resp >= 200 && resp <= 299;
   if (success) {
+    firstUpload = false;
     // If uploaded ok, then remove from circular buffer by removing count
     // This ensure that any written during upload will still be kept
     noInterrupts();
@@ -516,7 +517,23 @@ int calculateCurrentPowerWatts(int periodMs) {
 
 bool shouldUpload() {
   unsigned long timeSinceUpload = millis() - lastUploadMs;
-  if (backlightIsOn) {
+  // Hard limit on the max rate of uploads 
+  if (timeSinceUpload < 10 * 1000 && failureCount != 1) {
+    return false;
+  }
+  if (failureCount == 1) {
+    // If we have just failed, always retry immediatly 
+    return true;
+  } else if (failureCount != 0) {
+    unsigned long timeSinceLastFailure = millis() - lastFailureMs;
+    // Stupid exponential backoff
+    if (failureCount == 2) return timeSinceLastFailure > 11 * 1000;
+    if (failureCount == 3) return timeSinceLastFailure > 30 * 1000;
+    if (failureCount == 4) return timeSinceLastFailure > 60 * 1000;
+    return 120 * 1000;  // If failure count gets this long, then just fall back to once every 2 minutes
+  }
+
+  if (backlightIsOn) { 
     if (timeSinceUpload > ACTIVE_UPLOAD_INTERVAL) {
       Serial.println("Upload reason: active upload");
       return true;
@@ -544,15 +561,18 @@ void loop() {
   testLoop();
   unsigned long now = millis();
   if (shouldUpload()) {
-    lastUploadMs = now;
     if (uploadSamples()) {
-      uploadAfter = 1000 * SYNC_PERIOD_SECONDS;
+      // If upload failed, don't count as upload
+      // It will retry again after rate limit
+      lastUploadMs = now;
       failureCount = 0;
+      if (error == Error::SyncFailed) {
+        clearError();
+      }
     } else {
-      // On failure, retry sooner - just do multiplicative backoff capped at 5s
       failureCount += 1;
-      const int backoffCount = failureCount > 10 ? failureCount : failureCount;
-      uploadAfter = (backoffCount * 500);
+      lastFailureMs = millis();
+      setError(Error::SyncFailed);
     }
   }
 
@@ -561,9 +581,12 @@ void loop() {
     Serial.println("Refreshing");
     if (refresh()) {
       Serial.printf("Refresh OK! updateUrl=%s\n", refreshResult.updateUrl);
+      if (error == Error::RefreshFailed) {
+        clearError();
+      }
     } else {
-      // TODO
       Serial.printf("Refresh failed!\n");
+      setError(Error::RefreshFailed);
     }
   }
 
@@ -578,7 +601,10 @@ void loop() {
       } else if (currentScreen == Screen::CurrentAndDay) {
         currentScreen = Screen::Hello;
       } else if (currentScreen == Screen::Error) {
-        // TODO 
+        // If error is just for info and not persistant, then allow it to be cleared
+        if (canClearError(error)) {
+          currentScreen = Screen::CurrentAndDay;
+        }
       }
 
       if (TEST_MODE) {
@@ -621,8 +647,9 @@ void loop() {
     updateWifiAfter = 60 * 1000;
   }
 
-  if (currentUpdated) {
-    currentUpdated = false;
+  if (newPulseOccured) {
+    lastPulseUnix = timeClient.getEpochTime();
+    newPulseOccured = false;
     if (interval_buffer.size >= 1) {
       unsigned int newWatts = calculateCurrentPowerWatts(lastDurationUs / 1000);
       if (newWatts != screenState.currentWatts) {
@@ -686,16 +713,18 @@ void ICACHE_RAM_ATTR d3Rising() {
   lastPulseMicros = now;
 }
 
-
+// Quite a lot for a IRQ - but want to add to circular buffer so that 
+// if blocked by http requests, we still keep collecting pulses
 void ICACHE_RAM_ATTR d3Falling() {
   // Check duration pulse was high for
   // If too long, then mark as eratic
-  const unsigned long highDuration = micros() - lastPulseMicros;
-  if (highDuration <= MAX_DURATION_MICROS || lastPulseMicros == -1) {
+  unsigned long highDuration = micros() - lastPulseMicros;
+  bool isErratic = highDuration > MAX_DURATION_MICROS || highDuration < MIN_DURATION_MICROS || lastPulseDurationMicros < MIN_PERIOD_MICROS;
+  if (!isErratic || lastPulseMicros == -1) {
     if (sensorState == SensorState::Ok) {
       circular_add(&interval_buffer, lastPulseDurationMicros);
       lastDurationUs = lastPulseDurationMicros;
-      currentUpdated = true;
+      newPulseOccured = true;
     } else if (sensorState == SensorState::Disconnected) {
       sensorState = SensorState::Ok;
     } else if (sensorState == SensorState::Erratic) {
@@ -703,12 +732,14 @@ void ICACHE_RAM_ATTR d3Falling() {
       if (normalityCount >= RETURN_TO_NORMALITY_TRESH) {
         normalityCount = 0;
         sensorState = SensorState::Ok;
+        clearError();
       }
     }
   } else {
     normalityCount = 0;
-    sensorState = SensorState::Ok;
+    sensorState = SensorState::Erratic;
     hasBeenErratic = true;
+    setError(Error::ErraticSensor);
   }
 }
 
@@ -792,12 +823,10 @@ void lcdCurrentUsage(WifiStrength strength, int watts, int bufferSize, int minut
   lcd.print(finalTopLine);
 
   char bottomLine[17];
-  char finalBottomLine[17];
-
-  // On the bottom line, show circular buffer size and the time since last sync 
-  // TODO 
+  position = 0;
+  intToString(bottomLine, 16, &position, bufferSize, "?", 10);
   lcd.setCursor(0, 1);
-  lcd.print(finalBottomLine);
+  lcd.print(bottomLine);
 }
 
 void lcdConnectToAP() {
@@ -951,5 +980,4 @@ void performOta() {
     Serial.println("OTA failed");
   }
 }
-
 

@@ -1,7 +1,7 @@
 #define VERSION "v0.0.1"
 #define SENSOR_ID "dev"
 #define SYNC_PERIOD_SECONDS 2 // TODO set this!
-#define SENSOR_PIN 13
+#define SENSOR_PIN 13 // D7
 #define AP_SSID "EnergyMonitor"
 #define LCD_ADDR 0x27
 #define IMPL_PER_KWH 1000
@@ -9,7 +9,7 @@
 // Test mode - this just flashes the LED on pin 14 to check a second device
 #define TEST_MODE false
 // Send requests to local endpoints (defined below) instead of cloud run
-#define LOCAL_SERVER true
+#define LOCAL_SERVER false
 
 #if (LOCAL_SERVER == true)
 #undef SYNC_ENDPOINT

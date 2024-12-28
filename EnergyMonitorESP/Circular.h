@@ -3,7 +3,7 @@
 
 // TODO refine below
 // this is how large the capacity is
-#define CAPACITY 50
+#define CAPACITY 200
 
 struct circular_buffer {
     volatile unsigned int buffer[CAPACITY] = {0};

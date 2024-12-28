@@ -3,3 +3,10 @@
 build
 playground
 *.bin
+env
+
+# Doesn't matter as I'm the only one applying terraform - no need for remote state
+*.tfstate 
+notes.txt
+secrets.h
+certs
